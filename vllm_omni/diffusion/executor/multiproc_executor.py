@@ -48,6 +48,41 @@ _DLO_DP_WAVE_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_DLO_DP_WAVE_TIMEOUT", 6
 _WORKER_SHUTDOWN_GRACE_S = 15.0
 _WORKER_TERMINATE_GRACE_S = 5.0
 _WORKER_KILL_GRACE_S = 5.0
+# Pause between polls of a result queue while the result pump waits for the
+# next worker reply. 0 keeps vLLM's sched_yield() busy loop.
+_RESULT_PUMP_SPIN_PAUSE_S = max(float(os.environ.get("VLLM_OMNI_RESULT_PUMP_SPIN_PAUSE_US", "50")), 0.0) / 1e6
+
+
+def _relax_reader_spin(result_mq: MessageQueue, pause_s: float) -> bool:
+    """Make a shm reader sleep briefly between polls instead of spinning.
+
+    vLLM's reader keeps polling the ring buffer for ``busy_loop_s`` after every
+    read and only calls ``sched_yield()`` between polls. A pump thread that
+    waits for one reply per request is therefore runnable all the time and
+    keeps re-taking the GIL from the engine and frontend threads of the same
+    process, which stalled about 9% of BS=1 Pi0.5 requests by 0.5-1.7 ms.
+    Sleeping ``pause_s`` between polls releases the GIL for real and costs at
+    most that pause per reply. The idle wait on the notify socket is unchanged.
+
+    Returns whether the reader was patched (vLLM internals may differ).
+    """
+    condition = getattr(result_mq, "_spin_condition", None)
+    if pause_s <= 0 or condition is None or not getattr(condition, "is_reader", False):
+        return False
+    if not all(hasattr(condition, name) for name in ("wait", "last_read", "busy_loop_s")):
+        return False
+    idle_wait = condition.wait
+
+    def wait(timeout_ms: int | None = None) -> None:
+        if time.monotonic() <= condition.last_read + condition.busy_loop_s:
+            time.sleep(pause_s)
+        else:
+            idle_wait(timeout_ms=timeout_ms)
+
+    condition.wait = wait
+    return True
+
+
 _RESULT_PUMP_JOIN_TIMEOUT_S = 2.0
 # Upper bound on remembered dropped async_output_ids (see drop_output).
 _DROPPED_OUTPUT_IDS_MAX = 4096
@@ -919,6 +954,8 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pump_running = True
         self._pump_stop.clear()
         result_mqs = self._result_mqs or ([self._result_mq] if self._result_mq is not None else [])
+        for result_mq in result_mqs:
+            _relax_reader_spin(result_mq, _RESULT_PUMP_SPIN_PAUSE_S)
         self._result_pump_threads = [
             threading.Thread(
                 target=self._result_pump,
