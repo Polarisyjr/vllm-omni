@@ -1,0 +1,64 @@
+# π0.5 VLA, low-latency single-request deployment: bfloat16, 2 camera slots, 100 text tokens, 10-token action
+# chunks, the P0 runtime switches and the fast path (`pi05_fast_path`: fast bfloat16 kernels for the vision
+# tower, the prefix forward and the denoising loop, the whole request replayed as one CUDA graph).
+# 36 ms per request on an A100 against 46 ms without the fast path; see "Fast path" in
+# benchmarks/pi05/README.md. The keys shared with pi05.yaml are documented in recipes/lerobot/Pi05.md.
+#
+# The checkpoint must be trained for 10-token chunks (e.g. OpenPI's `pi05_libero`): one fine-tuned with
+# 50-token chunks loses task success when queried with 10. Name the checkpoint's own camera keys in
+# `image_feature_keys`.
+
+pipeline: pi05
+async_chunk: false
+distributed_executor_backend: mp
+# The fast path runs bfloat16 only.
+dtype: bfloat16
+
+stages:
+  - stage_id: 0
+    devices: "0"
+    # The fast denoising loop serves up to 320 attention rows (4 requests of 10 tokens); larger formed
+    # batches keep the fast vision tower and prefix forward and denoise on the fused per-step kernels.
+    max_num_seqs: 1
+    enforce_eager: false
+    model_class_name: Pi05Pipeline
+    custom_pipeline_args:
+      pi05_vision_precision: selective_bf16
+      pi05_batch_cameras: true
+      pi05_precompute_adarms: true
+      pi05_hoist_denoise_invariants: true
+      pi05_prefix_kv_only: true
+      pi05_fast_path: true
+    model_config:
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      chunk_size: 10
+      # Must equal chunk_size: this endpoint returns the whole chunk and keeps no
+      # action queue, so "execute the first N steps, then replan" is not available.
+      n_action_steps: 10
+      max_action_dim: 32
+      max_state_dim: 32
+      num_inference_steps: 10
+      image_resolution: [224, 224]
+      tokenizer_max_length: 100
+      state_num_bins: 256
+      max_cameras: 2
+      image_feature_keys:
+        - observation.images.base_0_rgb
+        - observation.images.left_wrist_0_rgb
+      image_key_map: {}
+      use_relative_actions: false
+      relative_exclude_joints:
+        - gripper
+      # OpenPI handshake metadata advertised to the robot client.
+      policy_server_config:
+        image_resolution: [224, 224]
+        n_external_cameras: 1
+        needs_wrist_camera: true
+        needs_stereo_camera: false
+        needs_session_id: false
+        action_space: joint_position
+        action_horizon: 10
+        action_dim: 32
+        max_action_dim: 32
+        max_cameras: 2

@@ -174,12 +174,12 @@ def run(args) -> None:
         precompute_adarms=on,
         hoist_denoise_invariants=on,
         prefix_kv_only=on,
-        fast_path=True if args.fast else None,
+        fast_path=args.fast,
         max_num_seqs=max(args.batches),
     )
     graphs, stages = model.cuda_graphs, Stages(model)
     dcgm = Dcgm(args.dcgm_gpu) if shutil.which("dcgmi") else None
-    parts = [args.mode, args.vision_precision or "fp32"] + ["all4"] * args.all4 + ["fast"] * args.fast
+    parts = [args.mode, args.vision_precision or "fp32"] + ["all4"] * args.all4 + ["fast"] * bool(args.fast)
     chain = args.name or "_".join(parts + [args.dtype] * (args.dtype != "bfloat16"))
     meta = {
         "chain": chain,
@@ -324,7 +324,12 @@ def main() -> int:
     parser.add_argument("--dtype", default="bfloat16", choices=["float32", "bfloat16"])
     parser.add_argument("--vision-precision", default=None, help="pi05_vision_precision, e.g. selective_bf16")
     parser.add_argument("--all4", action="store_true", help="Turn on the four opt-in runtime switches")
-    parser.add_argument("--fast", action="store_true", help="Turn on the iscadev fast path (needs --all4)")
+    parser.add_argument(
+        "--fast",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="pi05_fast_path on (needs --all4) or off; default: the deploy config's value",
+    )
     parser.add_argument("--name", help="Chain name (the output file's); default: derived from the options")
     parser.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
     parser.add_argument("--rounds", type=int, default=100, help="Timed rounds per batch size")

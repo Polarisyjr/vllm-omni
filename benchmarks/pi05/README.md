@@ -9,6 +9,7 @@ Latency benchmarks for π0.5 (`lerobot/pi05_base`) serving, used for the measure
 | `bench_batch_pi05.py` | Stage profile of `sample_actions` in rounds of B requests: time per stage (prefix embedding, prefill, denoising) and the DCGM activity of each stage looped alone. Writes one JSON per chain and a Markdown report over them. | A GPU and the checkpoint; `dcgmi` for the activity columns |
 | `bench_engine_overhead_pi05.py` | BS=1 latency of the layers in between: model-only and in-process pipeline in one clean process, then `Omni.generate` with the `uni` or `mp` executor. With `--trace-dir`, the per-request marks of `vllm_omni.utils.latency_trace`. | A GPU and the checkpoint |
 | `run_engine_overhead_matrix.sh`, `report_engine_overhead_pi05.py` | The full matrix for one dtype (independent runs of every layer plus traced and untraced client E2E, for one or two source trees) and its tables: the four layers, their gaps on the same requests, and p50/p95 per engine segment. | A GPU and the checkpoint |
+| `tune_fast_loop_pi05.py` | Tile sweep for the four GEMMs of the fast denoising loop, to retune `fast_pi05.DEFAULT_TILES` for another GPU or chunk length. | A GPU |
 
 ## Client E2E latency
 
@@ -104,6 +105,60 @@ The report also sets every batch against the same requests run one at a time (B 
 p50): req/s, speedup, scaling efficiency, the run's round-to-round spread and peak memory, per chain and
 batch size. The matching correctness check is `tests/diffusion/models/pi05/test_pi05_batch_parity.py`: each
 row of a formed batch against its request alone, and no cross-request contamination.
+
+## Fast path
+
+`pi05_fast_path` (stage `custom_pipeline_args`, with `pi05_precompute_adarms` and `pi05_hoist_denoise_invariants`; bfloat16 only) replaces three parts of a request with kernels shaped for short action chunks (`vllm_omni/diffusion/models/pi05/fast_pi05.py`):
+
+- the denoising loop: split-K GEMMs that stream the expert weights, one attention kernel over the KV cache, the reductions folded into the residual + AdaRMS kernels, all steps as one CUDA graph;
+- the prefix forward: one Q/K/V GEMM per layer, add + RMSNorm kernels, RoPE written straight into the KV cache, a flash-attention kernel with the mask;
+- the SigLIP encoder (with `pi05_vision_precision: selective_bf16`): one Q/K/V GEMM per layer, add + LayerNorm kernels, flash attention.
+
+A request of a captured batch size then replays as a single graph. The fast loop serves up to 320 attention rows per launch (4 requests of 10 action tokens, or 1 of 40); longer chunks and larger formed batches keep the fast prefix forward and vision tower and denoise on the fused per-step kernels.
+
+[`vllm_omni/deploy/pi05_low_latency.yaml`](../../vllm_omni/deploy/pi05_low_latency.yaml) is the deployment it was built for: bfloat16, 2 camera slots, 100 text tokens, 10 action tokens, every P0 switch and the fast path on. The checkpoint must be trained for 10-token chunks.
+
+```bash
+# serve
+vllm serve <checkpoint> --omni --port 8000 --deploy-config vllm_omni/deploy/pi05_low_latency.yaml --disable-log-stats
+
+# stage profile: the deployment as configured, then its baseline without the fast path
+python benchmarks/pi05/bench_batch_pi05.py --deploy-config vllm_omni/deploy/pi05_low_latency.yaml \
+  --batches 1 2 4 8 --name fast --out pi05_fast/
+python benchmarks/pi05/bench_batch_pi05.py --deploy-config vllm_omni/deploy/pi05_low_latency.yaml \
+  --no-fast --batches 1 2 4 8 --name baseline --out pi05_fast/
+python benchmarks/pi05/bench_batch_pi05.py --report pi05_fast/ --out-md pi05_fast/report.md
+
+# correctness: each fast component, whole requests and formed batches against the kernels they replace
+python -m pytest tests/diffusion/models/pi05/test_pi05_fast_path.py -v -s
+PI05_BATCH_PARITY_DTYPES=bfloat16 PI05_BATCH_PARITY_SIZES=1,2,4,8 \
+  PI05_BATCH_PARITY_DEPLOY=vllm_omni/deploy/pi05_low_latency.yaml \
+  python -m pytest tests/diffusion/models/pi05/test_pi05_batch_parity.py -v -s
+```
+
+A100-SXM4-80GB, bfloat16, P0 switches on, 10 denoising steps, p50 of whole `sample_actions` calls (the report's `sample_actions` rows, not the sum of the stages timed one by one):
+
+| Deployment | B | P0 baseline | fast path | speedup |
+| --- | ---: | ---: | ---: | ---: |
+| 2 cameras / 100 text tokens / 10 action tokens (`pi05_low_latency.yaml`) | 1 | 46.0 ms | **36.1 ms** | 1.27x |
+| | 2 | 68.2 ms | 55.5 ms | 1.23x |
+| | 4 | 112.0 ms | 93.6 ms | 1.20x |
+| | 8 | 197.8 ms | 173.9 ms | 1.14x |
+| 3 cameras / 200 text tokens / 50 action tokens (`pi05.yaml` in bfloat16, `--vision-precision selective_bf16 --all4 --fast`) | 1 | 62.9 ms | 58.7 ms | 1.07x |
+
+At batch 1 of the low-latency deployment the stages, timed one by one, go from 6.3 to 5.3 ms (prefix embedding), 20.7 to 17.5 ms (prefill) and 18.9 to 13.3 ms (denoising); replaying the request as one graph instead of one per region saves another 0.4 ms. Served over the OpenPI websocket with the `mp` executor and 256-px frames the round trip is 42.6 ms against 52.8 ms; with the in-process executor and frames the client has already resized to 224 px it is 39.3 ms.
+
+Numerics: the same dtypes as the bfloat16 path (bfloat16 GEMMs and K/V, float32 residual stream, softmax and accumulation) with other rounding points and reduction orders. A chunk moves by up to 1.6% (relative L2) from the baseline's on the test's requests, where bfloat16 itself moves it by up to 6% from float32. LIBERO closed-loop success with OpenPI's `pi05_libero` checkpoint (10-token chunks) served through the OpenPI endpoint, 4 suites × 10 tasks × 10 trials per arm and seed:
+
+| seed | P0 baseline | fast path | identical episodes | only baseline : only fast path |
+| --- | ---: | ---: | ---: | ---: |
+| 7 | 95.50% (382/400) | 96.00% (384/400) | 384/400 | 7 : 9 |
+| 8 | 97.25% (389/400) | 96.75% (387/400) | 384/400 | 9 : 7 |
+| both | 96.38% (771/800) | 96.38% (771/800) | 768/800 | 16 : 16 |
+
+Two seeds of one path differ on 23-27 of 400 episodes, so the 16 the two paths differ on per seed are within that spread.
+
+The tiles of the denoising GEMMs were swept on an A100 at 10 rows; `tune_fast_loop_pi05.py --rows <tokens>` repeats the sweep on another GPU or chunk length.
 
 ## Engine overhead
 
