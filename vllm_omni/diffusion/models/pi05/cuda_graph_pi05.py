@@ -196,6 +196,21 @@ class _DenoiseAllGraph:
 
 
 @dataclass
+class _RequestGraph:
+    """A whole ``sample_actions`` of one batch size on the fast path: the prefix
+    embedding, the prefix forward, the denoising invariants and the fast
+    denoising loop as one graph, noise in, action chunk out."""
+
+    graph: torch.cuda.CUDAGraph
+    images: list[torch.Tensor]
+    image_masks: list[torch.Tensor]
+    lang_tokens: torch.Tensor
+    lang_masks: torch.Tensor
+    noise: torch.Tensor
+    out: torch.Tensor
+
+
+@dataclass
 class _DenoiseStepGraph:
     graph: torch.cuda.CUDAGraph
     # Region 1's ``prefix_pad_masks`` output.
@@ -232,6 +247,10 @@ class Pi05CUDAGraphs:
         self._prefix_batches: dict[int, _PrefixForwardGraph] = {}
         self._denoise_batches: dict[int, _DenoiseStepGraph] = {}
         self._denoise_all: dict[int, _DenoiseAllGraph] = {}
+        self._requests: dict[int, _RequestGraph] = {}
+        # Serve whole requests from the request graphs when they exist; the
+        # stage benchmark turns this off to time the regions one by one.
+        self.request_graphs_enabled = True
         self.num_replays: Counter[str] = Counter()
 
     # ── Capture ──────────────────────────────────────────────────────
@@ -250,6 +269,7 @@ class Pi05CUDAGraphs:
             self._prefix_batches = {}
             self._denoise_batches = {}
             self._denoise_all = {}
+            self._requests = {}
             raise RuntimeError(
                 "π0.5 CUDA Graph capture failed. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
@@ -275,17 +295,20 @@ class Pi05CUDAGraphs:
                 if batch > 1
             }
 
-        self._embed_prefix, self._prefix_forward, self._denoise_step, loop = regions
-        self._embed_batches = {batch: embed for batch, (embed, _, _, _) in batches.items()}
-        self._prefix_batches = {batch: prefix for batch, (_, prefix, _, _) in batches.items()}
-        self._denoise_batches = {batch: denoise for batch, (_, _, denoise, _) in batches.items()}
-        self._denoise_all = {batch: loop for batch, (_, _, _, loop) in batches.items() if loop is not None}
+        self._embed_prefix, self._prefix_forward, self._denoise_step, loop, request = regions
+        self._embed_batches = {batch: embed for batch, (embed, *_) in batches.items()}
+        self._prefix_batches = {batch: prefix for batch, (_, prefix, *_) in batches.items()}
+        self._denoise_batches = {batch: denoise for batch, (_, _, denoise, *_) in batches.items()}
+        self._denoise_all = {batch: loop_ for batch, (_, _, _, loop_, _) in batches.items() if loop_ is not None}
+        self._requests = {batch: req for batch, (*_, req) in batches.items() if req is not None}
         if loop is not None:
             self._denoise_all[1] = loop
+        if request is not None:
+            self._requests[1] = request
 
     def _capture_regions(
         self, batch: int, kv_cache: Pi05KVCache | None, pool, device: torch.device
-    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph, _DenoiseAllGraph | None]:
+    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph, _DenoiseAllGraph | None, _RequestGraph | None]:
         """The three regions for a batch of ``batch`` requests, over ``kv_cache``
         (a new one of the batch's size when None), captured into ``pool`` in
         replay order.
@@ -414,7 +437,38 @@ class Pi05CUDAGraphs:
             with torch.cuda.graph(graph, pool=pool):
                 denoise_all()
             loop = _DenoiseAllGraph(graph, noise, x_all, kv_cache, context)
-        return embed_prefix, prefix_forward, denoise_step, loop
+
+        # Region 4 (iscadev): the whole request as one graph over the same static inputs.
+        request = None
+        if loop is not None:
+            noise_in = torch.zeros_like(noise)
+
+            def whole():
+                embs, pad_masks, att_masks = model.embed_prefix(images, image_masks, lang_tokens, lang_masks)
+                mask = prepare_attention_masks_4d(make_att_2d_masks(pad_masks, att_masks))
+                pos = torch.cumsum(pad_masks, dim=1) - 1
+                kwargs = dict(prefix_kwargs)
+                if options.hoist_denoise_invariants:
+                    kwargs["rotary_emb"] = model.prepare_prefix_rotary(embs, pos)
+                model.paligemma_with_expert.forward(
+                    attention_mask=mask,
+                    position_ids=pos,
+                    past_key_values=kv_cache,
+                    inputs_embeds=[embs, None],
+                    use_cache=True,
+                    **kwargs,
+                )
+                ctx = model.prepare_denoise_context(pad_masks)
+                x = noise_in.clone()
+                return fast.run(x, kv_cache, ctx)
+
+            whole()
+            torch.accelerator.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                out = whole()
+            request = _RequestGraph(graph, images, image_masks, lang_tokens, lang_masks, noise_in, out)
+        return embed_prefix, prefix_forward, denoise_step, loop, request
 
     def kv_cache_for(self, batch_size: int, prefix_len: int) -> Pi05KVCache | None:
         """The KV cache a formed batch of ``batch_size`` requests runs over: the
@@ -565,6 +619,40 @@ class Pi05CUDAGraphs:
             _load_rows(getattr(g.context, name), getattr(context, name))
         self.num_replays["prepare_denoise_context"] += 1
         return g.context
+
+    def request(
+        self,
+        images: list[torch.Tensor],
+        image_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+        noise: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The whole request on the graph of its batch size; None when no graph serves it."""
+        if not self.request_graphs_enabled or not isinstance(lang_tokens, torch.Tensor):
+            return None
+        g = self._requests.get(lang_tokens.shape[0])
+        if g is None or not (
+            torch.get_default_dtype() == _CAPTURE_DEFAULT_DTYPE
+            and len(images) == len(g.images)
+            and len(image_masks) == len(g.image_masks)
+            and all(_matches(src, static) for src, static in zip(images, g.images))
+            and all(_matches(src, static) for src, static in zip(image_masks, g.image_masks))
+            and _matches(lang_tokens, g.lang_tokens)
+            and _matches(lang_masks, g.lang_masks)
+            and _matches(noise, g.noise)
+        ):
+            return None
+        for static, src in zip(g.images, images):
+            _load(static, src)
+        for static, src in zip(g.image_masks, image_masks):
+            _load(static, src)
+        _load(g.lang_tokens, lang_tokens)
+        _load(g.lang_masks, lang_masks)
+        _load(g.noise, noise)
+        g.graph.replay()
+        self.num_replays["request"] += 1
+        return g.out.clone()
 
     def denoise_all(self, noise: torch.Tensor, past_key_values, context: Pi05DenoiseContext) -> torch.Tensor:
         """The fast denoising loop of ``noise``'s batch size (or the next captured

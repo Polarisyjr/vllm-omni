@@ -2272,8 +2272,13 @@ class Pi05ForActionPrediction(nn.Module):
                 )
 
         # The three regions below run through CUDA graphs when installed; each
-        # falls back to its eager call on its own.
+        # falls back to its eager call on its own. On the fast path a whole
+        # request of a captured batch size replays as one graph.
         graphs = self.cuda_graphs
+        if graphs is not None and self.fast_denoiser is not None and num_steps == self.fast_denoiser.num_steps:
+            out = graphs.request(images, image_masks, lang_tokens, lang_masks, noise)
+            if out is not None:
+                return out
         embed_prefix = self.embed_prefix if graphs is None else graphs.embed_prefix
         prefix_forward = self.paligemma_with_expert.forward if graphs is None else graphs.prefix_forward
         denoise_step = self.denoise_step if graphs is None else graphs.denoise_step

@@ -102,6 +102,9 @@ class Stages:
 
     def round(self, model, inputs: dict) -> dict:
         self.ms = dict.fromkeys(STAGES, 0.0)
+        if model.cuda_graphs is not None:
+            # Time the regions one by one; the unsplit loop below serves whole requests.
+            model.cuda_graphs.request_graphs_enabled = False
         start = time.perf_counter()
         model.sample_actions(**inputs)
         torch.accelerator.synchronize()
@@ -213,18 +216,25 @@ def run(args) -> None:
                 stages.round(model, inputs)
                 row["loops"] = [stage_loop(dcgm, s, lambda s=s: stages.replay(s), args.seconds) for s in STAGES]
                 stages.timed = False
+                if graphs is not None:
+                    graphs.request_graphs_enabled = True
 
                 def unsplit():
                     model.sample_actions(**inputs)
                     torch.accelerator.synchronize()
 
                 row["loops"].append(stage_loop(dcgm, "sample_actions", unsplit, args.seconds))
+                if graphs is not None and graphs.num_replays.get("request"):
+                    # The request graph's own p50, as the unsplit loop measured it.
+                    row["request_graph_ms"] = row["loops"][-1]["p50_ms"]
             except Exception as exc:  # a batch that cannot run is a result: report the limit, keep the rest
                 row = {"batch": batch, "error": f"{type(exc).__name__}: {exc}"[:300]}
                 torch.accelerator.empty_cache()
             stages.recorded = None
             result["batches"].append(row)
             summary = {key: round(percentiles(row[key])["p50_ms"], 2) for key in (*STAGES, "total") if key in row}
+            if "request_graph_ms" in row:
+                summary["request_graph"] = round(row["request_graph_ms"], 2)
             print(json.dumps({"batch": batch, **summary, "error": row.get("error")}), flush=True)
     if dcgm is not None:
         dcgm.proc.terminate()
