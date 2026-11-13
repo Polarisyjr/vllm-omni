@@ -687,8 +687,9 @@ class FastDenoiser:
 # fastest GEMM on an A100. What is fused here is everything around the GEMMs:
 # the Q/K/V projections run as one GEMM (three GEMMs of which two had 256
 # output columns), the residual add is folded into the norm that follows it,
-# RoPE writes K/V straight into the cache, and SigLIP's LayerNorms take their
-# residual add. The GEMM inputs and outputs are bf16, the prefix residual
+# RoPE writes K/V straight into the cache, the prefix attention is one
+# flash-attention kernel with the additive mask, and SigLIP's LayerNorms take
+# their residual add. The GEMM inputs and outputs are bf16, the prefix residual
 # stream float32 and SigLIP's bf16, as in the eager path.
 
 if HAS_TRITON:
@@ -804,17 +805,77 @@ if HAS_TRITON:
         bias = tl.load(BIAS + cols, mask=mask, other=0.0).to(tl.float32)
         tl.store(OUT + row * N + cols, (y * w + bias).to(tl.bfloat16), mask=mask)
 
+    @triton.jit
+    def _prefix_attn_kernel(
+        Q,
+        K,
+        V,
+        MASK,
+        OUT,
+        seq_len,
+        n_keys,
+        q_head_stride,
+        q_batch_stride,
+        kv_row_stride,
+        kv_batch_stride,
+        mask_row_stride,
+        mask_batch_stride,
+        out_stride,
+        scale,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        """Flash-attention forward of query rows ``rm`` of head ``program_id(1)`` of
+        request ``program_id(2)`` over the single KV head: float32 online softmax
+        of ``Q Kᵀ · scale + MASK[b, query, key]``, bf16 probabilities against V,
+        output stored as ``(b · seq_len + row, head · HEAD_DIM)`` for ``o_proj``."""
+        pid_m = tl.program_id(0)
+        head = tl.program_id(1)
+        b = tl.program_id(2)
+        HALF: tl.constexpr = HEAD_DIM // 2
+        rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        rmask = rm < seq_len
+        dh = tl.arange(0, HALF)
+        qb = Q + b * q_batch_stride + head * q_head_stride + rm[:, None] * HEAD_DIM
+        q_lo = tl.load(qb + dh[None, :], mask=rmask[:, None], other=0.0)
+        q_hi = tl.load(qb + HALF + dh[None, :], mask=rmask[:, None], other=0.0)
+        m_i = tl.full((BLOCK_M,), float("-inf"), dtype=tl.float32)
+        l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
+        acc_lo = tl.zeros((BLOCK_M, HALF), dtype=tl.float32)
+        acc_hi = tl.zeros((BLOCK_M, HALF), dtype=tl.float32)
+        kb = K + b * kv_batch_stride
+        vb = V + b * kv_batch_stride
+        mb = MASK + b * mask_batch_stride + rm[:, None] * mask_row_stride
+        for k0 in range(0, n_keys, BLOCK_N):
+            kidx = k0 + tl.arange(0, BLOCK_N)
+            kmask = kidx < n_keys
+            k_lo = tl.load(kb + kidx[None, :] * kv_row_stride + dh[:, None], mask=kmask[None, :], other=0.0)
+            k_hi = tl.load(kb + kidx[None, :] * kv_row_stride + HALF + dh[:, None], mask=kmask[None, :], other=0.0)
+            sc = (tl.dot(q_lo, k_lo) + tl.dot(q_hi, k_hi)) * scale
+            bias = tl.load(mb + kidx[None, :], mask=rmask[:, None] & kmask[None, :], other=0.0)
+            sc = tl.where(kmask[None, :], sc + bias.to(tl.float32), float("-inf"))
+            m_new = tl.maximum(m_i, tl.max(sc, axis=1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tldevice.exp(m_i - m_safe)
+            p = tldevice.exp(sc - m_safe[:, None])
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+            p16 = p.to(tl.bfloat16)
+            v_lo = tl.load(vb + kidx[:, None] * kv_row_stride + dh[None, :], mask=kmask[:, None], other=0.0)
+            v_hi = tl.load(vb + kidx[:, None] * kv_row_stride + HALF + dh[None, :], mask=kmask[:, None], other=0.0)
+            acc_lo = acc_lo * alpha[:, None] + tl.dot(p16, v_lo)
+            acc_hi = acc_hi * alpha[:, None] + tl.dot(p16, v_hi)
+            m_i = m_new
+        ob = OUT + (b * seq_len + rm)[:, None] * out_stride + head * HEAD_DIM
+        tl.store(ob + dh[None, :], (acc_lo / l_i[:, None]).to(tl.bfloat16), mask=rmask[:, None])
+        tl.store(ob + HALF + dh[None, :], (acc_hi / l_i[:, None]).to(tl.bfloat16), mask=rmask[:, None])
 
-def _attend_prefix(q, key, value, attention_mask, scaling):
-    """Eager ``_attend`` for one KV head: ``softmax(Q Kᵀ · scale + mask) V`` with a float32 softmax."""
-    scores = torch.matmul(q, key.transpose(2, 3)) * scaling + attention_mask[:, :, :, : key.shape[2]]
-    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    return torch.matmul(probs, value)
 
 
 class FastPrefix:
     """The prefix forward of ``PaliGemmaWithActionExpertPi05`` with fused Q/K/V
-    weights, add+norm kernels and RoPE into the cache; cuBLAS GEMMs."""
+    weights, add+norm kernels, RoPE into the cache and a flash-attention
+    kernel; cuBLAS GEMMs."""
 
     def __init__(self, model):
         if not HAS_TRITON:
@@ -886,6 +947,10 @@ class FastPrefix:
             residual = residual.clone()
         x_normed = torch.empty(n_rows, width, dtype=torch.bfloat16, device=device)
         q = torch.empty(batch, nh, seq_len, hd, dtype=torch.bfloat16, device=device)
+        att = torch.empty(n_rows, nh * hd, dtype=torch.bfloat16, device=device)
+        if attention_mask.shape != (batch, 1, seq_len, seq_len) or attention_mask.dtype != torch.float32:
+            raise ValueError(f"Unexpected prefix attention mask {tuple(attention_mask.shape)} {attention_mask.dtype}.")
+        mask = attention_mask[:, 0]
         last = len(self.layers) - 1
         mlp_out = None
         for idx, (in_norm, w_qkv, w_o, post_norm, w_gate, w_up, w_down) in enumerate(self.layers):
@@ -916,8 +981,28 @@ class FastPrefix:
             )
             if kv_only:
                 return None
-            att = _attend_prefix(q, key[:, None, :seq_len], value[:, None, :seq_len], attention_mask, self.scale)
-            att = att.transpose(1, 2).reshape(n_rows, nh * hd)
+            _prefix_attn_kernel[(triton.cdiv(seq_len, 64), nh, batch)](
+                q,
+                key,
+                value,
+                mask,
+                att,
+                seq_len,
+                seq_len,
+                q.stride(1),
+                q.stride(0),
+                key.stride(1),
+                key.stride(0),
+                mask.stride(1),
+                mask.stride(0),
+                att.stride(0),
+                self.scale,
+                HEAD_DIM=hd,
+                BLOCK_M=64,
+                BLOCK_N=128,
+                num_warps=8,
+                num_stages=1,
+            )
             attn_out = torch.nn.functional.linear(att, w_o)
             self._norm(attn_out, post_norm, x_normed, add=residual, res_out=residual)
             gate = torch.nn.functional.linear(x_normed, w_gate)
