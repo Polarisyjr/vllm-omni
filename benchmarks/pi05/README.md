@@ -136,17 +136,17 @@ PI05_BATCH_PARITY_DTYPES=bfloat16 PI05_BATCH_PARITY_SIZES=1,2,4,8 \
   python -m pytest tests/diffusion/models/pi05/test_pi05_batch_parity.py -v -s
 ```
 
-A100-SXM4-80GB, bfloat16, P0 switches on, 10 denoising steps, p50 of whole `sample_actions` calls (the report's `sample_actions` rows, not the sum of the stages timed one by one):
+A100-SXM4-80GB at its default clocks (1410 MHz at batch 1; check that `nvidia-smi -q` shows no clock limit left by `nvidia-smi -lgc`, a 990 MHz cap makes every number here 1.3x larger), bfloat16, P0 switches on, 10 denoising steps, p50 of whole `sample_actions` calls (the report's `sample_actions` rows, not the sum of the stages timed one by one):
 
 | Deployment | B | P0 baseline | fast path | speedup |
 | --- | ---: | ---: | ---: | ---: |
-| 2 cameras / 100 text tokens / 10 action tokens (`pi05_low_latency.yaml`) | 1 | 46.0 ms | **36.1 ms** | 1.27x |
-| | 2 | 68.2 ms | 55.5 ms | 1.23x |
-| | 4 | 112.0 ms | 93.6 ms | 1.20x |
-| | 8 | 197.8 ms | 173.9 ms | 1.14x |
-| 3 cameras / 200 text tokens / 50 action tokens (`pi05.yaml` in bfloat16, `--vision-precision selective_bf16 --all4 --fast`) | 1 | 62.9 ms | 58.7 ms | 1.07x |
+| 2 cameras / 100 text tokens / 10 action tokens (`pi05_low_latency.yaml`) | 1 | 33.8 ms | **27.0 ms** | 1.25x |
+| | 2 | 49.8 ms | 40.9 ms | 1.22x |
+| | 4 | 83.5 ms | 70.3 ms | 1.19x |
+| | 8 | 150.1 ms | 131.3 ms | 1.14x |
+| 3 cameras / 200 text tokens / 50 action tokens (`pi05.yaml` in bfloat16, `--vision-precision selective_bf16 --all4 --fast`) | 1 | 45.9 ms | 42.6 ms | 1.08x |
 
-At batch 1 of the low-latency deployment the stages, timed one by one, go from 6.3 to 5.3 ms (prefix embedding), 20.7 to 17.5 ms (prefill) and 18.9 to 13.3 ms (denoising); replaying the request as one graph instead of one per region saves another 0.4 ms. Served over the OpenPI websocket with the `mp` executor and 256-px frames the round trip is 42.6 ms against 52.8 ms; with the in-process executor and frames the client has already resized to 224 px it is 39.3 ms.
+At batch 1 of the low-latency deployment the stages, timed one by one, go from 4.5 to 3.8 ms (prefix embedding), 15.1 to 12.8 ms (prefill) and 14.2 to 10.4 ms (denoising); replaying the request as one graph instead of one per region saves another 0.35 ms. Served over the OpenPI websocket (`e2e_latency_pi05.py --views 2`, 224-px frames, `mp` executor) the round trip is 30.9 ms p50 against 38.0 ms.
 
 Numerics: the same dtypes as the bfloat16 path (bfloat16 GEMMs and K/V, float32 residual stream, softmax and accumulation) with other rounding points and reduction orders. A chunk moves by up to 1.6% (relative L2) from the baseline's on the test's requests, where bfloat16 itself moves it by up to 6% from float32. LIBERO closed-loop success with OpenPI's `pi05_libero` checkpoint (10-token chunks) served through the OpenPI endpoint, 4 suites × 10 tasks × 10 trials per arm and seed:
 
