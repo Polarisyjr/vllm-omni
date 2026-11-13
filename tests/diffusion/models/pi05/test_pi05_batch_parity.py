@@ -53,7 +53,7 @@ DTYPES = os.environ.get("PI05_BATCH_PARITY_DTYPES", "float32,bfloat16").split(",
 SIZES = tuple(sorted({int(size) for size in os.environ.get("PI05_BATCH_PARITY_SIZES", "1,2,4,8,16,32").split(",")}))
 # Optional stage ``custom_pipeline_args`` as JSON, e.g. the P0 switches and the iscadev fast path.
 PIPELINE_ARGS = json.loads(os.environ.get("PI05_BATCH_PARITY_PIPELINE_ARGS", "{}"))
-DEPLOY_CONFIG = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml"
+DEPLOY_CONFIG = Path(os.environ.get("PI05_BATCH_PARITY_DEPLOY", Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml"))
 
 # float32: how far a row of a batch may move from its request alone (relative
 # L2, largest absolute difference): the R2 acceptance bound. bfloat16 has no
