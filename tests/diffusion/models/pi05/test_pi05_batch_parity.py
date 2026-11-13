@@ -10,8 +10,9 @@ float32, each row of a batch must be the chunk its request gets alone within
 the R2 bound. In bfloat16 the layout's own rounding moves a chunk from the
 float32 one by several percent, and a batch rounds differently than a request
 alone, so a bfloat16 row is held to the float32 reference instead: no farther
-from it than the farthest request alone in bfloat16. In both, the other rows
-must not move when one row's request is replaced.
+from it than ``BFLOAT16_ENVELOPE_SLACK`` times the farthest request alone in
+bfloat16. In both, the other rows must not move when one row's request is
+replaced.
 
 Needs a CUDA GPU with memory for the largest batch (80 GB for 32 in float32)
 and the real checkpoint::
@@ -21,7 +22,15 @@ and the real checkpoint::
 ``PI05_PARITY_MODEL_PATH`` points at a local checkpoint to skip the HF download.
 ``PI05_BATCH_PARITY_DTYPES`` (default ``float32,bfloat16``) selects the serving
 dtypes; ``PI05_BATCH_PARITY_SIZES`` (default ``1,2,4,8,16,32``) the batch sizes,
-which are also the sizes the graphs are captured for.
+which are also the sizes the graphs are captured for. ``PI05_BATCH_PARITY_DEPLOY``
+names another deploy config (default ``vllm_omni/deploy/pi05.yaml``), whose
+model config and stage ``custom_pipeline_args`` the pipeline is built with;
+``PI05_BATCH_PARITY_PIPELINE_ARGS`` (JSON) replaces those arguments. The
+low-latency deployment with the fast path, which is bfloat16 only::
+
+    PI05_BATCH_PARITY_DTYPES=bfloat16 PI05_BATCH_PARITY_SIZES=1,2,4,8 \
+    PI05_BATCH_PARITY_DEPLOY=vllm_omni/deploy/pi05_low_latency.yaml \
+    python -m pytest tests/diffusion/models/pi05/test_pi05_batch_parity.py -v -s
 """
 
 from __future__ import annotations
@@ -51,15 +60,22 @@ pytestmark = [
 MODEL_PATH = os.environ.get("PI05_PARITY_MODEL_PATH", "lerobot/pi05_base")
 DTYPES = os.environ.get("PI05_BATCH_PARITY_DTYPES", "float32,bfloat16").split(",")
 SIZES = tuple(sorted({int(size) for size in os.environ.get("PI05_BATCH_PARITY_SIZES", "1,2,4,8,16,32").split(",")}))
-# Optional stage ``custom_pipeline_args`` as JSON, e.g. the P0 switches and the iscadev fast path.
-PIPELINE_ARGS = json.loads(os.environ.get("PI05_BATCH_PARITY_PIPELINE_ARGS", "{}"))
-DEPLOY_CONFIG = Path(os.environ.get("PI05_BATCH_PARITY_DEPLOY", Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml"))
+DEPLOY_CONFIG = Path(
+    os.environ.get("PI05_BATCH_PARITY_DEPLOY", Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml")
+)
 
 # float32: how far a row of a batch may move from its request alone (relative
 # L2, largest absolute difference): the R2 acceptance bound. bfloat16 has no
-# constant: a row may be as far from the float32 reference as the farthest of
-# the requests alone in bfloat16 is (up to 7.8% and 0.077 on an A100).
+# constant: a row is held to the distance of the farthest of the requests alone
+# in bfloat16 from the float32 reference (up to 7.8% and 0.077 on an A100).
 FLOAT32_TOLERANCE = (1e-4, 1e-4)
+# That envelope is the largest of a handful of draws (9 at batch sizes up to 8)
+# of the same rounding noise a batch row draws from again, so a row lands past
+# it by chance: by up to 1.21x with 50-token chunks and 1.33x with 10-token
+# chunks on an A100, where float32 rows stay within 2e-5 of their requests
+# alone. A row with another request's mask, padding or cache row is off by its
+# whole norm, not by a third of the envelope.
+BFLOAT16_ENVELOPE_SLACK = 1.5
 
 # Instructions of different lengths, so rows differ in valid text tokens and padding.
 PROMPTS = (
@@ -79,10 +95,19 @@ def _resolve_checkpoint_dir() -> str:
     return snapshot_download(repo_id=MODEL_PATH, repo_type="model")
 
 
+def _deploy_stage() -> dict:
+    (stage,) = yaml.safe_load(DEPLOY_CONFIG.read_text())["stages"]
+    return stage
+
+
 def _deploy_model_config() -> dict:
-    deploy = yaml.safe_load(DEPLOY_CONFIG.read_text())
-    (stage,) = deploy["stages"]
-    return stage["model_config"]
+    return _deploy_stage()["model_config"]
+
+
+def _pipeline_args() -> dict:
+    """The stage's ``custom_pipeline_args``, or ``PI05_BATCH_PARITY_PIPELINE_ARGS`` in their place."""
+    override = os.environ.get("PI05_BATCH_PARITY_PIPELINE_ARGS")
+    return json.loads(override) if override is not None else dict(_deploy_stage().get("custom_pipeline_args") or {})
 
 
 def _robot_obs(config, index: int) -> dict:
@@ -140,7 +165,7 @@ def pipeline(request):
         model_config=_deploy_model_config(),
         enforce_eager=False,
         max_num_seqs=max(SIZES),
-        custom_pipeline_args=PIPELINE_ARGS,
+        custom_pipeline_args=_pipeline_args(),
     )
     # Constructed the way DiffusersLoader does it: under the serving dtype as
     # torch's default dtype, which is also when the CUDA graphs are captured.
@@ -203,7 +228,8 @@ def _distance(mine: torch.Tensor, other: torch.Tensor) -> tuple[float, float]:
 def _assert_rows(pipeline, alone, reference, actual: torch.Tensor, rows: list[_Request], label: str) -> None:
     """Each row of ``actual`` is its request's chunk: in float32 the one it gets
     alone within ``FLOAT32_TOLERANCE``; in bfloat16 no farther from the float32
-    reference than the farthest of all the requests alone in bfloat16."""
+    reference than ``BFLOAT16_ENVELOPE_SLACK`` times the farthest of all the
+    requests alone in bfloat16."""
     dtype = pipeline._torch_dtype
     mine = [actual[position : position + 1] for position in range(len(rows))]
     if dtype == torch.float32:
@@ -212,7 +238,8 @@ def _assert_rows(pipeline, alone, reference, actual: torch.Tensor, rows: list[_R
         against = "the request alone"
     else:
         by_themselves = [_distance(alone[index], reference[index]) for index in alone]
-        max_rel, max_abs = max(d[0] for d in by_themselves), max(d[1] for d in by_themselves)
+        max_rel = BFLOAT16_ENVELOPE_SLACK * max(d[0] for d in by_themselves)
+        max_abs = BFLOAT16_ENVELOPE_SLACK * max(d[1] for d in by_themselves)
         distances = [_distance(row, reference[request.index]) for row, request in zip(mine, rows)]
         against = "the float32 reference"
     for position, (request, (rel, abs_diff)) in enumerate(zip(rows, distances)):
