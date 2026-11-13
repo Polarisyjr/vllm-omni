@@ -185,6 +185,17 @@ class _PrefixForwardGraph:
 
 
 @dataclass
+class _DenoiseAllGraph:
+    """The fast denoising loop (``fast_pi05``) of one batch size as one graph."""
+
+    graph: torch.cuda.CUDAGraph
+    noise: torch.Tensor
+    x_t: torch.Tensor
+    kv_cache: Pi05KVCache
+    context: Pi05DenoiseContext
+
+
+@dataclass
 class _DenoiseStepGraph:
     graph: torch.cuda.CUDAGraph
     # Region 1's ``prefix_pad_masks`` output.
@@ -220,6 +231,7 @@ class Pi05CUDAGraphs:
         self._embed_batches: dict[int, _EmbedPrefixGraph] = {}
         self._prefix_batches: dict[int, _PrefixForwardGraph] = {}
         self._denoise_batches: dict[int, _DenoiseStepGraph] = {}
+        self._denoise_all: dict[int, _DenoiseAllGraph] = {}
         self.num_replays: Counter[str] = Counter()
 
     # ── Capture ──────────────────────────────────────────────────────
@@ -237,6 +249,7 @@ class Pi05CUDAGraphs:
             self._embed_batches = {}
             self._prefix_batches = {}
             self._denoise_batches = {}
+            self._denoise_all = {}
             raise RuntimeError(
                 "π0.5 CUDA Graph capture failed. Set `enforce_eager: true` in the deploy "
                 "config, or pass --enforce-eager, to serve eagerly."
@@ -262,14 +275,17 @@ class Pi05CUDAGraphs:
                 if batch > 1
             }
 
-        self._embed_prefix, self._prefix_forward, self._denoise_step = regions
-        self._embed_batches = {batch: embed for batch, (embed, _, _) in batches.items()}
-        self._prefix_batches = {batch: prefix for batch, (_, prefix, _) in batches.items()}
-        self._denoise_batches = {batch: denoise for batch, (_, _, denoise) in batches.items()}
+        self._embed_prefix, self._prefix_forward, self._denoise_step, loop = regions
+        self._embed_batches = {batch: embed for batch, (embed, _, _, _) in batches.items()}
+        self._prefix_batches = {batch: prefix for batch, (_, prefix, _, _) in batches.items()}
+        self._denoise_batches = {batch: denoise for batch, (_, _, denoise, _) in batches.items()}
+        self._denoise_all = {batch: loop for batch, (_, _, _, loop) in batches.items() if loop is not None}
+        if loop is not None:
+            self._denoise_all[1] = loop
 
     def _capture_regions(
         self, batch: int, kv_cache: Pi05KVCache | None, pool, device: torch.device
-    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph]:
+    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph, _DenoiseAllGraph | None]:
         """The three regions for a batch of ``batch`` requests, over ``kv_cache``
         (a new one of the batch's size when None), captured into ``pool`` in
         replay order.
@@ -380,7 +396,25 @@ class Pi05CUDAGraphs:
         with torch.cuda.graph(graph, pool=pool):
             v_t = step(prefix_pad_masks)
         denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
-        return embed_prefix, prefix_forward, denoise_step
+
+        # Region 3b (iscadev): the whole fast denoising loop, noise in, chunk out.
+        loop = None
+        fast = getattr(model, "fast_denoiser", None)
+        if fast is not None and context is not None and batch <= fast.max_batch:
+            noise = torch.zeros(batch, model.action_horizon, model.action_dim, dtype=torch.float32, device=device)
+            x_all = torch.zeros_like(noise)
+
+            def denoise_all():
+                x_all.copy_(noise)
+                return fast.run(x_all, kv_cache, context)
+
+            denoise_all()
+            torch.accelerator.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                denoise_all()
+            loop = _DenoiseAllGraph(graph, noise, x_all, kv_cache, context)
+        return embed_prefix, prefix_forward, denoise_step, loop
 
     def kv_cache_for(self, batch_size: int, prefix_len: int) -> Pi05KVCache | None:
         """The KV cache a formed batch of ``batch_size`` requests runs over: the
@@ -531,6 +565,27 @@ class Pi05CUDAGraphs:
             _load_rows(getattr(g.context, name), getattr(context, name))
         self.num_replays["prepare_denoise_context"] += 1
         return g.context
+
+    def denoise_all(self, noise: torch.Tensor, past_key_values, context: Pi05DenoiseContext) -> torch.Tensor:
+        """The fast denoising loop of ``noise``'s batch size (or the next captured
+        size, whose extra rows are dropped), replayed as one graph; eager on
+        the fast kernels when no graph serves the call."""
+        batch = noise.shape[0]
+        g = self._denoise_all.get(batch)
+        if g is None:
+            larger = [size for size in self._denoise_all if size > batch]
+            g = self._denoise_all[min(larger)] if larger else None
+        if g is not None and not (
+            _serves(past_key_values, g.kv_cache) and context is g.context and _matches_rows(noise, g.noise)
+        ):
+            logger.warning_once("π0.5 fast denoising inputs differ from the captured ones; it runs without a graph.")
+            g = None
+        if g is None:
+            return self._model.fast_denoise(noise, past_key_values, context)
+        _load_rows(g.noise, noise)
+        g.graph.replay()
+        self.num_replays["denoise_all"] += 1
+        return g.x_t[:batch].clone()
 
     def denoise_step(
         self,

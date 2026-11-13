@@ -329,6 +329,13 @@ class Pi05Pipeline(nn.Module):
                 "config, or pass --enforce-eager, to serve eagerly."
             ) from exc
         batch_sizes = graph_batch_sizes(getattr(od_config, "max_num_seqs", 1))
+        if self.runtime_options.fast_path:
+            from vllm_omni.diffusion.models.pi05.fast_pi05 import FastDenoiser
+
+            if not (self.runtime_options.precompute_adarms and self.runtime_options.hoist_denoise_invariants):
+                raise RuntimeError("pi05_fast_path needs pi05_precompute_adarms and pi05_hoist_denoise_invariants.")
+            self.model.fast_denoiser = FastDenoiser(self.model, max_batch=max(batch_sizes))
+            logger.info("Pi05Pipeline: fast denoising loop installed (iscadev).")
         graphs = Pi05CUDAGraphs(self.model, batch_sizes=batch_sizes)
         start = time.perf_counter()
         allocated = torch.accelerator.memory_allocated()

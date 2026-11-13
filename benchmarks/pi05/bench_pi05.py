@@ -63,6 +63,7 @@ def build_model(
     precompute_adarms: bool | None = None,
     hoist_denoise_invariants: bool | None = None,
     prefix_kv_only: bool | None = None,
+    fast_path: bool | None = None,
     execution_mode: str | None = None,
     max_num_seqs: int = 1,
 ):
@@ -86,6 +87,7 @@ def build_model(
         ("pi05_precompute_adarms", precompute_adarms),
         ("pi05_hoist_denoise_invariants", hoist_denoise_invariants),
         ("pi05_prefix_kv_only", prefix_kv_only),
+        ("pi05_fast_path", fast_path),
     ):
         if value is not None:
             custom_args[key] = value
@@ -270,6 +272,7 @@ def main() -> int:
     parser.add_argument("--precompute-adarms", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--hoist-denoise-invariants", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--prefix-kv-only", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--fast-path", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--execution-mode", choices=["eager", "fused", "graph"], default=None)
     parser.add_argument(
         "--enforce-eager",
@@ -302,6 +305,7 @@ def main() -> int:
         precompute_adarms=args.precompute_adarms,
         hoist_denoise_invariants=args.hoist_denoise_invariants,
         prefix_kv_only=args.prefix_kv_only,
+        fast_path=args.fast_path,
         execution_mode=args.execution_mode,
     )
     device = str(next(model.parameters()).device)

@@ -1772,6 +1772,8 @@ class Pi05ForActionPrediction(nn.Module):
         # ``None`` runs ``sample_actions`` eagerly (the baseline). ``Pi05Pipeline``
         # installs a ``Pi05CUDAGraphs`` unless the stage sets ``enforce_eager``.
         self.cuda_graphs: Pi05CUDAGraphs | None = None
+        # iscadev fast denoising loop (``fast_pi05.FastDenoiser``), installed by the pipeline.
+        self.fast_denoiser = None
         # Allocated once by ``Pi05Pipeline`` after the model reaches its device
         # and dtype. ``sample_actions`` falls back to a one-off cache when this
         # is unset or sized for another batch or prefix length.
@@ -2205,6 +2207,11 @@ class Pi05ForActionPrediction(nn.Module):
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         return self.action_out_proj(suffix_out)
 
+    def fast_denoise(self, noise: torch.Tensor, kv_cache: Pi05KVCache, context: Pi05DenoiseContext) -> torch.Tensor:
+        """The whole denoising loop on the fast kernels, from ``noise`` to the action chunk."""
+        x_t = noise.to(torch.float32).contiguous().clone()
+        return self.fast_denoiser.run(x_t, kv_cache, context)
+
     # ── Full action generation ───────────────────────────────────────
     @torch.no_grad()
     def sample_actions(
@@ -2293,6 +2300,18 @@ class Pi05ForActionPrediction(nn.Module):
                 context = graphs.prepare_denoise_context(context)
 
         # 3. Euler-integrated denoising from t=1 down to t=0.
+        fast = self.fast_denoiser
+        if (
+            fast is not None
+            and context is not None
+            and step_table is not None
+            and num_steps == fast.num_steps
+            and bsize <= fast.max_batch
+            and isinstance(past_key_values, Pi05KVCache)
+            and past_key_values.suffix_len == self.action_horizon
+        ):
+            denoise_all = self.fast_denoise if graphs is None else graphs.denoise_all
+            return denoise_all(noise, past_key_values, context)
         dt = -1.0 / num_steps
         x_t = noise
         for step in range(num_steps):
