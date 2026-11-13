@@ -1552,6 +1552,9 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
         self.vision_options = Pi05VisionOptions()
+        # iscadev fast paths (``fast_pi05.FastPrefix`` / ``FastVision``), installed by the pipeline.
+        self.fast_prefix = None
+        self.fast_vision = None
 
     def _install_patch_embedding(self) -> None:
         """Run SigLIP's patch convolution as a GEMM over the patches (``_PatchEmbedding``)."""
@@ -1604,8 +1607,11 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
             # The R0 prefix residual stream inherits this FP32 interface. Keep
             # it fixed so the experiment changes only vision/projector precision.
             return image_features.float()
-        vision_outputs = self.paligemma.model.vision_tower(pixel_values)
-        image_features = self.paligemma.model.multi_modal_projector(vision_outputs.last_hidden_state)
+        if self.fast_vision is not None:
+            hidden = self.fast_vision.run(pixel_values)
+        else:
+            hidden = self.paligemma.model.vision_tower(pixel_values).last_hidden_state
+        image_features = self.paligemma.model.multi_modal_projector(hidden)
         return image_features.float() if self.vision_options.precision == "selective_bf16" else image_features
 
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
@@ -1666,6 +1672,16 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
                 and _fused_kernels_serve(self, past_key_values, hidden_states.shape[0])
                 and past_key_values.prefix_len == hidden_states.shape[1]
             ):
+                if self.fast_prefix is not None:
+                    hidden_states = self.fast_prefix.run(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_values,
+                        prefix_kv_only=prefix_kv_only,
+                        rotary_emb=rotary_emb,
+                    )
+                    return [hidden_states, None], past_key_values
                 hidden_states = _fused_prefix_forward(
                     self.paligemma,
                     hidden_states,

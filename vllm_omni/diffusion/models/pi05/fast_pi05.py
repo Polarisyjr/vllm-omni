@@ -678,3 +678,329 @@ class FastDenoiser:
                         num_warps=8,
                     )
         return x_t
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Prefix forward (PaliGemma LM over the prefix) and SigLIP vision tower
+# ──────────────────────────────────────────────────────────────────────
+# Both are compute-bound GEMM chains at 512-612 rows, where cuBLAS is the
+# fastest GEMM on an A100. What is fused here is everything around the GEMMs:
+# the Q/K/V projections run as one GEMM (three GEMMs of which two had 256
+# output columns), the residual add is folded into the norm that follows it,
+# RoPE writes K/V straight into the cache, and SigLIP's LayerNorms take their
+# residual add. The GEMM inputs and outputs are bf16, the prefix residual
+# stream float32 and SigLIP's bf16, as in the eager path.
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _prefix_rope_kernel(
+        QKV,
+        COS,
+        SIN,
+        Q_OUT,
+        K_CACHE,
+        V_CACHE,
+        n_rows,
+        seq_len,
+        qkv_stride,
+        kv_row_stride,
+        kv_batch_stride,
+        NUM_HEADS: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        HAS_Q: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        """Rows ``rm`` of the fused QKV projection ``(n_rows, (heads + 2) · HEAD_DIM)``
+        (``(2 · HEAD_DIM)`` without ``HAS_Q``), head ``program_id(1)``: Gemma's
+        half-split RoPE with eager's bf16 rounding points on Q and K; Q stored
+        ``(requests, heads, seq_len, HEAD_DIM)``, K/V into the cache's prefix slots."""
+        HALF: tl.constexpr = HEAD_DIM // 2
+        rm = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask = rm[:, None] < n_rows
+        if HAS_Q:
+            head = tl.program_id(1)
+            col0 = head * HEAD_DIM
+        else:
+            head = tl.program_id(1) + NUM_HEADS
+            col0 = tl.program_id(1) * HEAD_DIM
+        b = rm // seq_len
+        t = rm % seq_len
+        cols = tl.arange(0, HALF)
+        src = QKV + rm[:, None] * qkv_stride + col0 + cols[None, :]
+        lo = tl.load(src, mask=row_mask, other=0.0).to(tl.float32)
+        hi = tl.load(src + HALF, mask=row_mask, other=0.0).to(tl.float32)
+        if head <= NUM_HEADS:
+            rope = rm[:, None] * HEAD_DIM + cols[None, :]
+            cos_lo = tl.load(COS + rope, mask=row_mask, other=0.0).to(tl.float32)
+            cos_hi = tl.load(COS + rope + HALF, mask=row_mask, other=0.0).to(tl.float32)
+            sin_lo = tl.load(SIN + rope, mask=row_mask, other=0.0).to(tl.float32)
+            sin_hi = tl.load(SIN + rope + HALF, mask=row_mask, other=0.0).to(tl.float32)
+            # ``q · cos + rotate_half(q) · sin``, each product and the sum rounded as eager's bf16 ops.
+            out_lo = _bf16(_bf16(lo * cos_lo) + _bf16(-hi * sin_lo))
+            out_hi = _bf16(_bf16(hi * cos_hi) + _bf16(lo * sin_hi))
+            if head < NUM_HEADS:
+                dst = Q_OUT + ((b * NUM_HEADS + head) * seq_len + t)[:, None] * HEAD_DIM + cols[None, :]
+            else:
+                dst = K_CACHE + b[:, None] * kv_batch_stride + t[:, None] * kv_row_stride + cols[None, :]
+            tl.store(dst, out_lo.to(tl.bfloat16), mask=row_mask)
+            tl.store(dst + HALF, out_hi.to(tl.bfloat16), mask=row_mask)
+        else:
+            dst = V_CACHE + b[:, None] * kv_batch_stride + t[:, None] * kv_row_stride + cols[None, :]
+            tl.store(dst, lo.to(tl.bfloat16), mask=row_mask)
+            tl.store(dst + HALF, hi.to(tl.bfloat16), mask=row_mask)
+
+    @triton.jit
+    def _add_rms_norm_kernel(
+        X,
+        ADD,
+        RES_OUT,
+        WEIGHT,
+        OUT,
+        eps,
+        N: tl.constexpr,
+        HAS_ADD: tl.constexpr,
+    ):
+        """Row ``r``: ``RES_OUT = ADD + X`` (float32; ``ADD`` may be ``RES_OUT``) and Gemma's
+        ``RMSNorm(RES_OUT) · (1 + weight)`` rounded to bf16 into ``OUT``."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, N)
+        x = tl.load(X + row * N + cols).to(tl.float32)
+        if HAS_ADD:
+            x = tl.load(ADD + row * N + cols).to(tl.float32) + x
+            tl.store(RES_OUT + row * N + cols, x)
+        var = tl.sum(x * x, axis=0) / N
+        normed = x * tldevice.rsqrt(var + eps)
+        weight = tl.load(WEIGHT + cols).to(tl.float32)
+        tl.store(OUT + row * N + cols, (normed * (1.0 + weight)).to(tl.bfloat16))
+
+    @triton.jit
+    def _add_layer_norm_kernel(
+        X,
+        ADD,
+        RES_OUT,
+        WEIGHT,
+        BIAS,
+        OUT,
+        eps,
+        N: tl.constexpr,
+        BLOCK: tl.constexpr,
+        HAS_ADD: tl.constexpr,
+    ):
+        """Row ``r``: ``RES_OUT = bf16(ADD + X)`` (SigLIP's bf16 residual stream) and
+        ``LayerNorm(RES_OUT)`` in float32 rounded to bf16 into ``OUT``."""
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK)
+        mask = cols < N
+        x = tl.load(X + row * N + cols, mask=mask, other=0.0).to(tl.float32)
+        if HAS_ADD:
+            x = _bf16(tl.load(ADD + row * N + cols, mask=mask, other=0.0).to(tl.float32) + x)
+            tl.store(RES_OUT + row * N + cols, x.to(tl.bfloat16), mask=mask)
+        mean = tl.sum(x, axis=0) / N
+        xc = tl.where(mask, x - mean, 0.0)
+        var = tl.sum(xc * xc, axis=0) / N
+        y = xc * tldevice.rsqrt(var + eps)
+        w = tl.load(WEIGHT + cols, mask=mask, other=0.0).to(tl.float32)
+        bias = tl.load(BIAS + cols, mask=mask, other=0.0).to(tl.float32)
+        tl.store(OUT + row * N + cols, (y * w + bias).to(tl.bfloat16), mask=mask)
+
+
+def _attend_prefix(q, key, value, attention_mask, scaling):
+    """Eager ``_attend`` for one KV head: ``softmax(Q Kᵀ · scale + mask) V`` with a float32 softmax."""
+    scores = torch.matmul(q, key.transpose(2, 3)) * scaling + attention_mask[:, :, :, : key.shape[2]]
+    probs = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    return torch.matmul(probs, value)
+
+
+class FastPrefix:
+    """The prefix forward of ``PaliGemmaWithActionExpertPi05`` with fused Q/K/V
+    weights, add+norm kernels and RoPE into the cache; cuBLAS GEMMs."""
+
+    def __init__(self, model):
+        if not HAS_TRITON:
+            raise RuntimeError("The π0.5 fast prefix forward needs Triton.")
+        lm = model.paligemma_with_expert.paligemma.model.language_model
+        self.lm = lm
+        attn0 = lm.layers[0].self_attn
+        self.dtype = attn0.q_proj.weight.dtype
+        if self.dtype != torch.bfloat16:
+            raise RuntimeError(f"The fast prefix forward runs bfloat16 GEMMs, not {self.dtype}.")
+        if attn0.config.num_key_value_heads != 1:
+            raise RuntimeError("The fast prefix forward needs a single KV head.")
+        self.num_heads = attn0.config.num_attention_heads
+        self.head_dim = attn0.head_dim
+        self.width = attn0.q_proj.in_features
+        self.n_q = self.num_heads * self.head_dim
+        self.layers = []
+        with torch.no_grad():
+            for layer in lm.layers:
+                attn, mlp = layer.self_attn, layer.mlp
+                w_qkv = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight]).contiguous()
+                attn.q_proj.weight = nn.Parameter(w_qkv[: self.n_q], requires_grad=False)
+                attn.k_proj.weight = nn.Parameter(w_qkv[self.n_q : self.n_q + self.head_dim], requires_grad=False)
+                attn.v_proj.weight = nn.Parameter(w_qkv[self.n_q + self.head_dim :], requires_grad=False)
+                self.layers.append(
+                    (
+                        layer.input_layernorm,
+                        w_qkv,
+                        attn.o_proj.weight,
+                        layer.post_attention_layernorm,
+                        mlp.gate_proj.weight,
+                        mlp.up_proj.weight,
+                        mlp.down_proj.weight,
+                    )
+                )
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+
+    def _norm(self, x, norm, out, add=None, res_out=None):
+        n_rows, n = x.shape
+        _add_rms_norm_kernel[(n_rows,)](
+            x,
+            add if add is not None else x,
+            res_out if res_out is not None else x,
+            norm.weight,
+            out,
+            norm.eps,
+            N=n,
+            HAS_ADD=add is not None,
+            num_warps=8,
+        )
+
+    def run(self, inputs_embeds, attention_mask, position_ids, kv_cache, *, prefix_kv_only=False, rotary_emb=None):
+        """``PaliGemmaWithActionExpertPi05.forward``'s prefix pass: writes every
+        layer's prefix K/V into ``kv_cache``; returns the final hidden state, or
+        None with ``prefix_kv_only``."""
+        from vllm_omni.diffusion.models.pi05.modeling_pi05 import _fused_gelu_mul
+
+        lm = self.lm
+        batch, seq_len, width = inputs_embeds.shape
+        n_rows = batch * seq_len
+        device = inputs_embeds.device
+        nh, hd = self.num_heads, self.head_dim
+        cos, sin = lm.rotary_emb(inputs_embeds.new_empty((), dtype=self.dtype), position_ids) if rotary_emb is None else rotary_emb
+        cos, sin = cos.reshape(n_rows, hd), sin.reshape(n_rows, hd)
+        if cos.dtype != torch.bfloat16:
+            cos, sin = cos.to(torch.bfloat16), sin.to(torch.bfloat16)
+        residual = inputs_embeds.reshape(n_rows, width).to(torch.float32).contiguous()
+        if residual.data_ptr() == inputs_embeds.data_ptr():
+            residual = residual.clone()
+        x_normed = torch.empty(n_rows, width, dtype=torch.bfloat16, device=device)
+        q = torch.empty(batch, nh, seq_len, hd, dtype=torch.bfloat16, device=device)
+        last = len(self.layers) - 1
+        mlp_out = None
+        for idx, (in_norm, w_qkv, w_o, post_norm, w_gate, w_up, w_down) in enumerate(self.layers):
+            if mlp_out is None:
+                self._norm(residual, in_norm, x_normed)
+            else:
+                self._norm(mlp_out, in_norm, x_normed, add=residual, res_out=residual)
+            key, value = kv_cache.key[idx, :, 0], kv_cache.value[idx, :, 0]  # (B, prefix + suffix, hd)
+            kv_only = prefix_kv_only and idx == last
+            qkv = torch.nn.functional.linear(x_normed, w_qkv[self.n_q :] if kv_only else w_qkv)
+            _prefix_rope_kernel[(triton.cdiv(n_rows, 64), 2 if kv_only else nh + 2)](
+                qkv,
+                cos,
+                sin,
+                q,
+                key,
+                value,
+                n_rows,
+                seq_len,
+                qkv.stride(0),
+                key.stride(1),
+                key.stride(0),
+                NUM_HEADS=nh,
+                HEAD_DIM=hd,
+                HAS_Q=not kv_only,
+                BLOCK_M=64,
+                num_warps=4,
+            )
+            if kv_only:
+                return None
+            att = _attend_prefix(q, key[:, None, :seq_len], value[:, None, :seq_len], attention_mask, self.scale)
+            att = att.transpose(1, 2).reshape(n_rows, nh * hd)
+            attn_out = torch.nn.functional.linear(att, w_o)
+            self._norm(attn_out, post_norm, x_normed, add=residual, res_out=residual)
+            gate = torch.nn.functional.linear(x_normed, w_gate)
+            _fused_gelu_mul(gate, torch.nn.functional.linear(x_normed, w_up), gate)
+            mlp_out = torch.nn.functional.linear(gate, w_down)
+        hidden = residual + mlp_out.to(torch.float32)
+        return lm.norm(hidden.view(batch, seq_len, width))
+
+
+class FastVision:
+    """SigLIP's encoder with fused Q/K/V weights, add+LayerNorm kernels and
+    flash attention; the embeddings (float32 patch GEMM + positions) and the
+    projector are the module's own."""
+
+    def __init__(self, model):
+        if not HAS_TRITON:
+            raise RuntimeError("The π0.5 fast vision tower needs Triton.")
+        tower = model.paligemma_with_expert.paligemma.model.vision_tower
+        self.vision = getattr(tower, "vision_model", tower)
+        encoder = self.vision.encoder
+        layer0 = encoder.layers[0]
+        if layer0.self_attn.q_proj.weight.dtype != torch.bfloat16:
+            raise RuntimeError("The fast vision tower runs a bfloat16 encoder (pi05_vision_precision selective_bf16).")
+        self.num_heads = layer0.self_attn.num_heads
+        self.head_dim = layer0.self_attn.head_dim
+        self.width = layer0.self_attn.embed_dim
+        self.layers = []
+        with torch.no_grad():
+            for layer in encoder.layers:
+                attn, mlp = layer.self_attn, layer.mlp
+                w_qkv = torch.cat([attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight]).contiguous()
+                b_qkv = torch.cat([attn.q_proj.bias, attn.k_proj.bias, attn.v_proj.bias]).contiguous()
+                w = self.width
+                attn.q_proj.weight = nn.Parameter(w_qkv[:w], requires_grad=False)
+                attn.k_proj.weight = nn.Parameter(w_qkv[w : 2 * w], requires_grad=False)
+                attn.v_proj.weight = nn.Parameter(w_qkv[2 * w :], requires_grad=False)
+                attn.q_proj.bias = nn.Parameter(b_qkv[:w], requires_grad=False)
+                attn.k_proj.bias = nn.Parameter(b_qkv[w : 2 * w], requires_grad=False)
+                attn.v_proj.bias = nn.Parameter(b_qkv[2 * w :], requires_grad=False)
+                self.layers.append((layer.layer_norm1, w_qkv, b_qkv, attn.out_proj, layer.layer_norm2, mlp.fc1, mlp.fc2))
+        self.post_norm = self.vision.post_layernorm
+        self.block = triton.next_power_of_2(self.width)
+
+    def _norm(self, x, norm, out, add=None, res_out=None):
+        n_rows, n = x.shape
+        _add_layer_norm_kernel[(n_rows,)](
+            x,
+            add if add is not None else x,
+            res_out if res_out is not None else x,
+            norm.weight,
+            norm.bias,
+            out,
+            norm.eps,
+            N=n,
+            BLOCK=self.block,
+            HAS_ADD=add is not None,
+            num_warps=4,
+        )
+
+    def run(self, pixel_values):
+        """``vision_tower(pixel_values).last_hidden_state``."""
+        h = self.vision.embeddings(pixel_values)  # (B, tokens, width), bf16 after the hook
+        batch, tokens, width = h.shape
+        n_rows = batch * tokens
+        nh, hd = self.num_heads, self.head_dim
+        residual = h.reshape(n_rows, width).contiguous()
+        if residual.data_ptr() == h.data_ptr():
+            residual = residual.clone()
+        x = torch.empty_like(residual)
+        mlp_out = None
+        for ln1, w_qkv, b_qkv, out_proj, ln2, fc1, fc2 in self.layers:
+            if mlp_out is None:
+                self._norm(residual, ln1, x)
+            else:
+                self._norm(mlp_out, ln1, x, add=residual, res_out=residual)
+            qkv = torch.nn.functional.linear(x, w_qkv, b_qkv).view(batch, tokens, 3, nh, hd)
+            q, k, v = (qkv[:, :, i].transpose(1, 2) for i in range(3))
+            att = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            att = att.transpose(1, 2).reshape(n_rows, width)
+            o = out_proj(att)
+            self._norm(o, ln2, x, add=residual, res_out=residual)
+            f = torch.nn.functional.gelu(fc1(x), approximate="tanh")
+            mlp_out = fc2(f)
+        out = torch.empty_like(residual)
+        self._norm(mlp_out, self.post_norm, out, add=residual, res_out=residual)
+        return out.view(batch, tokens, width)

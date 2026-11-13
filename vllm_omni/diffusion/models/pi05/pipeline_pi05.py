@@ -330,12 +330,16 @@ class Pi05Pipeline(nn.Module):
             ) from exc
         batch_sizes = graph_batch_sizes(getattr(od_config, "max_num_seqs", 1))
         if self.runtime_options.fast_path:
-            from vllm_omni.diffusion.models.pi05.fast_pi05 import FastDenoiser
+            from vllm_omni.diffusion.models.pi05.fast_pi05 import FastDenoiser, FastPrefix, FastVision
 
             if not (self.runtime_options.precompute_adarms and self.runtime_options.hoist_denoise_invariants):
                 raise RuntimeError("pi05_fast_path needs pi05_precompute_adarms and pi05_hoist_denoise_invariants.")
+            backbone = self.model.paligemma_with_expert
             self.model.fast_denoiser = FastDenoiser(self.model, max_batch=max(batch_sizes))
-            logger.info("Pi05Pipeline: fast denoising loop installed (iscadev).")
+            backbone.fast_prefix = FastPrefix(self.model)
+            if self.vision_options.precision == "selective_bf16":
+                backbone.fast_vision = FastVision(self.model)
+            logger.info("Pi05Pipeline: fast denoising loop, prefix forward and vision tower installed (iscadev).")
         graphs = Pi05CUDAGraphs(self.model, batch_sizes=batch_sizes)
         start = time.perf_counter()
         allocated = torch.accelerator.memory_allocated()
