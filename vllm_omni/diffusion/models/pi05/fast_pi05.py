@@ -1,12 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Fast bfloat16 denoising loop for π0.5 (iscadev).
+# ruff: noqa: N803
+"""The π0.5 fast path (``pi05_fast_path``): bfloat16 kernels for short action chunks.
 
-The action expert runs on ``chunk_size`` rows per request (10-50), so every
-GEMM of a denoising step is a weight stream: the time of a step is set by how
-fast 622 MB of expert weights (bf16) and the KV cache move through the GPU and
-by the number of kernels launched, not by FLOPs. The kernels here are shaped
-for that:
+Three drop-in replacements for parts of ``sample_actions``, installed by
+``Pi05Pipeline`` and captured by ``Pi05CUDAGraphs`` (one graph per request):
+
+* ``FastDenoiser``: the whole denoising loop of the action expert.
+* ``FastPrefix``: the prefix forward of the PaliGemma language model.
+* ``FastVision``: the SigLIP encoder.
+
+**Denoising loop.** The action expert runs on ``chunk_size`` rows per request
+(10-50), so every GEMM of a denoising step is a weight stream: the time of a
+step is set by how fast 622 MB of expert weights (bf16) and the KV cache move
+through the GPU and by the number of kernels launched, not by FLOPs. The
+kernels are shaped for that:
 
 * ``_skinny_gemm_kernel``: a split-K GEMM over ``BLOCK_M = 16`` rows that
   writes float32 partial sums, so that enough CTAs stream the weight in
@@ -26,7 +34,14 @@ Eight kernels per layer, against the nine of the fused path, each shaped for
 10-50 rows. Numerics: bfloat16 weights and activations, float32 residual stream,
 accumulation and softmax, as the eager bfloat16 path; the reduction orders differ from it.
 Every row is computed independently of the other rows of its launch, so a
-request gets the same bits alone and in a formed batch.
+request gets the same bits from the loop alone and in a formed batch.
+
+**Prefix forward and vision tower.** Compute-bound GEMM chains at 512-612 rows,
+where cuBLAS is the fastest GEMM; the kernels fuse what surrounds the GEMMs
+(see the second half of this module).
+
+Tested against the kernels it replaces in
+``tests/diffusion/models/pi05/test_pi05_fast_path.py``.
 """
 
 from __future__ import annotations
@@ -255,9 +270,7 @@ if HAS_TRITON:
             kr_lo = (k_lo_s * c_lo - k_hi_s * s_lo).to(tl.bfloat16)
             kr_hi = (k_hi_s * c_hi + k_lo_s * s_hi).to(tl.bfloat16)
             sc_s = (tl.dot(qr_lo, tl.trans(kr_lo)) + tl.dot(qr_hi, tl.trans(kr_hi))) * scale
-            bias_s = tl.load(
-                mask_base + prefix_len + ts[None, :], mask=row_mask[:, None] & smask[None, :], other=0.0
-            )
+            bias_s = tl.load(mask_base + prefix_len + ts[None, :], mask=row_mask[:, None] & smask[None, :], other=0.0)
             sc_s = tl.where(smask[None, :], sc_s + bias_s.to(tl.float32), float("-inf"))
             m_new = tl.maximum(m_i, tl.max(sc_s, axis=1))
             m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
@@ -296,15 +309,15 @@ if HAS_TRITON:
         for s in tl.static_range(KV_SPLITS):
             m = tl.maximum(m, tl.load(PART_M + (b * KV_SPLITS + s) * n_rows + r))
         acc = tl.zeros((HEAD_DIM,), dtype=tl.float32)
-        l = tl.zeros((), dtype=tl.float32)
+        total = tl.zeros((), dtype=tl.float32)
         for s in tl.static_range(KV_SPLITS):
             part = (b * KV_SPLITS + s) * n_rows + r
             w = tldevice.exp(tl.load(PART_M + part) - m)
-            l += w * tl.load(PART_L + part)
+            total += w * tl.load(PART_L + part)
             acc += w * tl.load(PART_O + part * HEAD_DIM + d)
         head = r // q_len
         t = r % q_len
-        out = acc / l
+        out = acc / total
         tl.store(OUT + (b * q_len + t) * out_stride + head * HEAD_DIM + d, out.to(tl.bfloat16))
 
     @triton.jit
@@ -407,19 +420,30 @@ class GemmTiles:
 
 @dataclass(frozen=True)
 class AttnTiles:
+    """Tiles of the denoising attention, per request (``heads · action tokens`` query rows).
+
+    ``kv_splits`` programs share a row tile's keys. A split takes a whole
+    number of ``block_n`` key blocks, so the prefix fills only the first
+    ``ceil(prefix_len / keys_per_split)`` of them and the last split always
+    adds the suffix keys. At the 612-key prefix of 2 cameras and 100 text
+    tokens that is 5 prefix splits, 2 idle ones and one with the suffix keys
+    alone: as fast as 6 or 9 splits within 0.1 ms per request, and 0.9 ms
+    faster than 5, where the suffix keys follow 100 prefix keys in one program.
+    """
+
     block_r: int = 16
     block_n: int = 64
     kv_splits: int = 8
     num_warps: int = 4
     num_stages: int = 2
-    # From 128 query rows on (formed batches): swept at 400 rows.
+    # From 128 query rows per request on (chunks of 16 tokens or more): swept at 400 rows.
     block_r_large: int = 16
     num_warps_large: int = 8
     block_n_large: int = 128
     kv_splits_large: int = 4
 
 
-# Tiles per GEMM, from an in-situ sweep on an A100 at 10 rows (results/iscadev/tune_gemm.py).
+# Tiles per GEMM, from a sweep on an A100 at 10 rows (benchmarks/pi05/tune_fast_loop_pi05.py).
 DEFAULT_TILES: dict[str, GemmTiles] = {
     "qkv": GemmTiles(64, 128, 2, 4, 4),
     "o": GemmTiles(64, 64, 4, 4, 4),
@@ -427,16 +451,17 @@ DEFAULT_TILES: dict[str, GemmTiles] = {
     "down": GemmTiles(64, 128, 4, 4, 4),
 }
 DEFAULT_ATTN = AttnTiles()
-BLOCK_M = 16
-# The fast loop serves launches of at most this many attention rows (requests ·
-# heads · action tokens): beyond it the R2 fused step, whose kernels tile 50-row
-# chunks, is as fast or faster. 320 rows is 4 requests of 10 tokens or 1 of 40.
+# ``Pi05Pipeline`` gives the fast loop launches of at most this many attention
+# rows (requests · heads · action tokens): beyond it the fused per-step kernels,
+# which tile 50-row chunks, are as fast or faster. 320 rows is 4 requests of
+# 10 tokens or 1 of 40. The kernels themselves are correct for any size.
 MAX_FAST_ROWS = 320
 
 
 def fast_loop_max_batch(model, max_batch: int) -> int:
     """How many requests of ``model``'s chunk the fast loop serves, at most ``max_batch``; 0 for none."""
-    rows = model.action_horizon * model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.config.num_attention_heads
+    attention = model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn
+    rows = model.action_horizon * attention.config.num_attention_heads
     return min(max_batch, MAX_FAST_ROWS // rows)
 
 
@@ -605,9 +630,8 @@ class FastDenoiser:
         if n_rows < 128:
             block_r, block_n, kv_splits, attn_warps = a.block_r, a.block_n, a.kv_splits, a.num_warps
         else:
-            block_r, block_n, kv_splits, attn_warps = a.block_r_large, a.block_n_large, a.kv_splits_large, a.num_warps_large
-        if n_rows > MAX_FAST_ROWS:
-            raise ValueError(f"The fast loop serves at most {MAX_FAST_ROWS} attention rows, got {n_rows}.")
+            block_r, block_n, kv_splits = a.block_r_large, a.block_n_large, a.kv_splits_large
+            attn_warps = a.num_warps_large
         keys_per_split = triton.cdiv(triton.cdiv(prefix_len, kv_splits), block_n) * block_n
         t = self.tiles
         dt = -1.0 / num_steps
@@ -898,7 +922,6 @@ if HAS_TRITON:
         tl.store(ob + HALF + dh[None, :], (acc_hi / l_i[:, None]).to(tl.bfloat16), mask=rmask[:, None])
 
 
-
 class FastPrefix:
     """The prefix forward of ``PaliGemmaWithActionExpertPi05`` with fused Q/K/V
     weights, add+norm kernels, RoPE into the cache and a flash-attention
@@ -965,7 +988,9 @@ class FastPrefix:
         n_rows = batch * seq_len
         device = inputs_embeds.device
         nh, hd = self.num_heads, self.head_dim
-        cos, sin = lm.rotary_emb(inputs_embeds.new_empty((), dtype=self.dtype), position_ids) if rotary_emb is None else rotary_emb
+        if rotary_emb is None:
+            rotary_emb = lm.rotary_emb(inputs_embeds.new_empty((), dtype=self.dtype), position_ids)
+        cos, sin = rotary_emb
         cos, sin = cos.reshape(n_rows, hd), sin.reshape(n_rows, hd)
         if cos.dtype != torch.bfloat16:
             cos, sin = cos.to(torch.bfloat16), sin.to(torch.bfloat16)
@@ -1069,7 +1094,9 @@ class FastVision:
                 attn.q_proj.bias = nn.Parameter(b_qkv[:w], requires_grad=False)
                 attn.k_proj.bias = nn.Parameter(b_qkv[w : 2 * w], requires_grad=False)
                 attn.v_proj.bias = nn.Parameter(b_qkv[2 * w :], requires_grad=False)
-                self.layers.append((layer.layer_norm1, w_qkv, b_qkv, attn.out_proj, layer.layer_norm2, mlp.fc1, mlp.fc2))
+                self.layers.append(
+                    (layer.layer_norm1, w_qkv, b_qkv, attn.out_proj, layer.layer_norm2, mlp.fc1, mlp.fc2)
+                )
         self.post_norm = self.vision.post_layernorm
         self.block = triton.next_power_of_2(self.width)
 

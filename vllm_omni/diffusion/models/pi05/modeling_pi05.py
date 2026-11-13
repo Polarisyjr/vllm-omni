@@ -1506,6 +1506,11 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
     the expert's stock layout apart from the norms themselves.
     """
 
+    # The fast path's prefix forward and vision tower (``fast_pi05.FastPrefix`` /
+    # ``FastVision``); ``Pi05Pipeline`` installs them with ``pi05_fast_path``.
+    fast_prefix = None
+    fast_vision = None
+
     def __init__(self, vlm_config, action_expert_config):
         super().__init__()
 
@@ -1552,9 +1557,6 @@ class PaliGemmaWithActionExpertPi05(nn.Module):
         # optimized path; ``False`` is the eager baseline.
         self.fused_kernels = False
         self.vision_options = Pi05VisionOptions()
-        # iscadev fast paths (``fast_pi05.FastPrefix`` / ``FastVision``), installed by the pipeline.
-        self.fast_prefix = None
-        self.fast_vision = None
 
     def _install_patch_embedding(self) -> None:
         """Run SigLIP's patch convolution as a GEMM over the patches (``_PatchEmbedding``)."""
@@ -1751,6 +1753,10 @@ class Pi05ForActionPrediction(nn.Module):
       4. Return ``x_0`` as the predicted action chunk.
     """
 
+    # The fast path's denoising loop (``fast_pi05.FastDenoiser``); ``Pi05Pipeline``
+    # installs it with ``pi05_fast_path``.
+    fast_denoiser = None
+
     def __init__(self, config, quant_config=None, prefix: str = ""):
         super().__init__()
         # ``quant_config`` is accepted for interface compatibility but unused —
@@ -1788,8 +1794,6 @@ class Pi05ForActionPrediction(nn.Module):
         # ``None`` runs ``sample_actions`` eagerly (the baseline). ``Pi05Pipeline``
         # installs a ``Pi05CUDAGraphs`` unless the stage sets ``enforce_eager``.
         self.cuda_graphs: Pi05CUDAGraphs | None = None
-        # iscadev fast denoising loop (``fast_pi05.FastDenoiser``), installed by the pipeline.
-        self.fast_denoiser = None
         # Allocated once by ``Pi05Pipeline`` after the model reaches its device
         # and dtype. ``sample_actions`` falls back to a one-off cache when this
         # is unset or sized for another batch or prefix length.

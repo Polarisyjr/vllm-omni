@@ -24,6 +24,7 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -38,6 +39,7 @@ from vllm_omni.diffusion.models.pi05.config import (
     resolve_excluded_action_indices,
 )
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
+from vllm_omni.diffusion.models.pi05.fast_pi05 import MAX_FAST_ROWS, fast_loop_max_batch
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -68,6 +70,44 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 def test_p0_rejects_invalid_vision_options(args):
     with pytest.raises(ValueError):
         Pi05VisionOptions.from_pipeline_args(args)
+
+
+_FAST_PATH_ARGS = {"pi05_precompute_adarms": True, "pi05_hoist_denoise_invariants": True, "pi05_fast_path": True}
+
+
+def test_fast_path_option_is_off_by_default_and_parsed():
+    assert Pi05RuntimeOptions.from_pipeline_args({}).fast_path is False
+    assert Pi05RuntimeOptions.from_pipeline_args(_FAST_PATH_ARGS).fast_path is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        {**_FAST_PATH_ARGS, "pi05_fast_path": "true"},
+        {**_FAST_PATH_ARGS, "pi05_precompute_adarms": False},
+        {**_FAST_PATH_ARGS, "pi05_hoist_denoise_invariants": False},
+        {"pi05_fast_path": True},
+    ],
+    ids=["not_a_boolean", "no_adarms_schedule", "no_hoisted_invariants", "alone"],
+)
+def test_fast_path_option_rejects_what_it_cannot_run(args):
+    with pytest.raises(ValueError):
+        Pi05RuntimeOptions.from_pipeline_args(args)
+
+
+@pytest.mark.parametrize(
+    ("chunk", "max_batch", "expected"),
+    [(10, 1, 1), (10, 4, 4), (10, 32, 4), (20, 8, 2), (40, 8, 1), (50, 8, 0)],
+)
+def test_fast_loop_serves_launches_up_to_its_row_limit(chunk, max_batch, expected):
+    """The fast loop takes ``requests x heads x action tokens`` up to ``MAX_FAST_ROWS``."""
+    heads = 8
+    attention = SimpleNamespace(config=SimpleNamespace(num_attention_heads=heads))
+    expert = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)]))
+    model = SimpleNamespace(action_horizon=chunk, paligemma_with_expert=SimpleNamespace(gemma_expert=expert))
+    served = fast_loop_max_batch(model, max_batch)
+    assert served == expected
+    assert served * chunk * heads <= MAX_FAST_ROWS
 
 
 def _p0_vision_model():
@@ -1144,6 +1184,7 @@ def _graph_install_pipeline(device: str, events: list, monkeypatch, fused_kernel
     monkeypatch.setattr(Pi05CUDAGraphs, "capture", lambda graphs: events.append("capture"))
     pipeline = object.__new__(Pi05Pipeline)
     pipeline._device = torch.device(device)
+    pipeline.runtime_options = Pi05RuntimeOptions()
     pipeline.model = _GraphTarget(events, fused_kernels_error)
     return pipeline
 

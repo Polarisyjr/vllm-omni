@@ -308,7 +308,9 @@ class Pi05CUDAGraphs:
 
     def _capture_regions(
         self, batch: int, kv_cache: Pi05KVCache | None, pool, device: torch.device
-    ) -> tuple[_EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph, _DenoiseAllGraph | None, _RequestGraph | None]:
+    ) -> tuple[
+        _EmbedPrefixGraph, _PrefixForwardGraph, _DenoiseStepGraph, _DenoiseAllGraph | None, _RequestGraph | None
+    ]:
         """The three regions for a batch of ``batch`` requests, over ``kv_cache``
         (a new one of the batch's size when None), captured into ``pool`` in
         replay order.
@@ -420,7 +422,7 @@ class Pi05CUDAGraphs:
             v_t = step(prefix_pad_masks)
         denoise_step = _DenoiseStepGraph(graph, prefix_pad_masks, kv_cache, x_t, timestep, v_t, context, step_data)
 
-        # Region 3b (iscadev): the whole fast denoising loop, noise in, chunk out.
+        # Region 3b (fast path): the whole fast denoising loop, noise in, chunk out.
         loop = None
         fast = getattr(model, "fast_denoiser", None)
         if fast is not None and context is not None and batch <= fast.max_batch:
@@ -438,7 +440,7 @@ class Pi05CUDAGraphs:
                 denoise_all()
             loop = _DenoiseAllGraph(graph, noise, x_all, kv_cache, context)
 
-        # Region 4 (iscadev): the whole request as one graph over the same static inputs.
+        # Region 4 (fast path): the whole request as one graph over the same static inputs.
         request = None
         if loop is not None:
             noise_in = torch.zeros_like(noise)

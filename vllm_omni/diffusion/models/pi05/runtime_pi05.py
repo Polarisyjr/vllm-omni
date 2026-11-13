@@ -10,8 +10,9 @@ class Pi05RuntimeOptions:
     precompute_adarms: bool = False
     hoist_denoise_invariants: bool = False
     prefix_kv_only: bool = False
-    # iscadev: the fast bfloat16 kernels (``fast_pi05``) for the denoising loop,
-    # captured as one CUDA graph per batch size. Needs the two switches above.
+    # The fast bfloat16 kernels (``fast_pi05``) for the vision tower, the prefix
+    # forward and the denoising loop, a whole request captured as one CUDA graph
+    # per batch size. Needs ``precompute_adarms`` and ``hoist_denoise_invariants``.
     fast_path: bool = False
 
     def __post_init__(self):
@@ -19,6 +20,8 @@ class Pi05RuntimeOptions:
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"pi05_{name} must be a boolean, got {value!r}.")
+        if self.fast_path and not (self.precompute_adarms and self.hoist_denoise_invariants):
+            raise ValueError("pi05_fast_path needs pi05_precompute_adarms and pi05_hoist_denoise_invariants.")
 
     @classmethod
     def from_pipeline_args(cls, args: dict | None) -> "Pi05RuntimeOptions":
