@@ -955,7 +955,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         self._pump_stop.clear()
         result_mqs = self._result_mqs or ([self._result_mq] if self._result_mq is not None else [])
         for result_mq in result_mqs:
-            _relax_reader_spin(result_mq, _RESULT_PUMP_SPIN_PAUSE_S)
+            if not _relax_reader_spin(result_mq, _RESULT_PUMP_SPIN_PAUSE_S) and _RESULT_PUMP_SPIN_PAUSE_S > 0:
+                logger.warning_once(
+                    "The diffusion result pump keeps vLLM's busy-wait between polls: this vLLM's shm reader "
+                    "does not have the layout the pause (VLLM_OMNI_RESULT_PUMP_SPIN_PAUSE_US) patches."
+                )
         self._result_pump_threads = [
             threading.Thread(
                 target=self._result_pump,
