@@ -69,18 +69,19 @@ class Stages:
     def __init__(self, model):
         graphs = model.cuda_graphs
         if graphs is not None:
-            owners = [(graphs, "embed_prefix"), (graphs, "prefix_forward"), (graphs, "denoise_step")]
+            owners = [[(graphs, "embed_prefix")], [(graphs, "prefix_forward")], [(graphs, "denoise_step")]]
         else:
-            owners = [(model, "embed_prefix"), (model.paligemma_with_expert, "forward"), (model, "denoise_step")]
+            owners = [[(model, "embed_prefix")], [(model.paligemma_with_expert, "forward")], [(model, "denoise_step")]]
         if getattr(model, "fast_denoiser", None) is not None:
-            # The fast path runs the whole loop through one entry point.
-            owners[2] = (graphs, "denoise_all") if graphs is not None else (model, "fast_denoise")
+            # The fast path runs the whole loop through one entry point for the batches it serves.
+            owners[2].append((graphs, "denoise_all") if graphs is not None else (model, "fast_denoise"))
         self.timed = True
         self.ms = dict.fromkeys(STAGES, 0.0)
         self.recorded: dict[str, list] | None = None
         self._inside = False
-        for stage, (owner, name) in zip(STAGES, owners):
-            setattr(owner, name, self._wrap(stage, getattr(owner, name)))
+        for stage, stage_owners in zip(STAGES, owners):
+            for owner, name in stage_owners:
+                setattr(owner, name, self._wrap(stage, getattr(owner, name)))
 
     def _wrap(self, stage: str, fn):
         def call(*args, **kwargs):

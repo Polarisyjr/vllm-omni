@@ -412,6 +412,11 @@ class AttnTiles:
     kv_splits: int = 8
     num_warps: int = 4
     num_stages: int = 2
+    # From 128 query rows on (formed batches): swept at 400 rows.
+    block_r_large: int = 16
+    num_warps_large: int = 8
+    block_n_large: int = 128
+    kv_splits_large: int = 4
 
 
 # Tiles per GEMM, from an in-situ sweep on an A100 at 10 rows (results/iscadev/tune_gemm.py).
@@ -423,6 +428,21 @@ DEFAULT_TILES: dict[str, GemmTiles] = {
 }
 DEFAULT_ATTN = AttnTiles()
 BLOCK_M = 16
+# The fast loop serves launches of at most this many attention rows (requests ·
+# heads · action tokens): beyond it the R2 fused step, whose kernels tile 50-row
+# chunks, is as fast or faster. 320 rows is 4 requests of 10 tokens or 1 of 40.
+MAX_FAST_ROWS = 320
+
+
+def fast_loop_max_batch(model, max_batch: int) -> int:
+    """How many requests of ``model``'s chunk the fast loop serves, at most ``max_batch``; 0 for none."""
+    rows = model.action_horizon * model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.config.num_attention_heads
+    return min(max_batch, MAX_FAST_ROWS // rows)
+
+
+def _block_m(m: int) -> int:
+    """The row tile of a launch over ``m`` rows: one tile up to 64 rows, 64-row tiles beyond."""
+    return min(64, max(16, triton.next_power_of_2(m)))
 
 
 class FastDenoiser:
@@ -508,7 +528,7 @@ class FastDenoiser:
         n_qkv = (nh + 2) * hd
         f32, bf16 = torch.float32, torch.bfloat16
         t = self.tiles
-        parts = max_batch * self.attn.kv_splits * nh * self.horizon
+        parts = max_batch * max(self.attn.kv_splits, self.attn.kv_splits_large) * nh * self.horizon
         self.res = torch.empty(m, w, dtype=f32, device=device)
         self.xn = torch.empty(m, w, dtype=bf16, device=device)
         self.p_qkv = torch.empty(t["qkv"].splits, m, n_qkv, dtype=f32, device=device)
@@ -529,7 +549,8 @@ class FastDenoiser:
         gelu_out = out is not None
         if gelu_out and (not dual or tiles.splits != 1):
             raise ValueError("The GELU epilogue needs the dual gate/up GEMM with one split.")
-        grid = (triton.cdiv(n, tiles.block_n), tiles.splits, triton.cdiv(m, BLOCK_M))
+        block_m = _block_m(m)
+        grid = (triton.cdiv(n, tiles.block_n), tiles.splits, triton.cdiv(m, block_m))
         _skinny_gemm_kernel[grid](
             x,
             w,
@@ -540,7 +561,7 @@ class FastDenoiser:
             k,
             x.stride(0),
             w.stride(0),
-            BLOCK_M=BLOCK_M,
+            BLOCK_M=block_m,
             BLOCK_N=tiles.block_n,
             BLOCK_K=tiles.block_k,
             SPLITS=tiles.splits,
@@ -581,7 +602,13 @@ class FastDenoiser:
         p_qkv, p_o, p_gu, p_down = self.p_qkv[:, :m], self.p_o[:, :m], self.p_gu[:, :m], self.p_down[:, :m]
         n_rows = nh * horizon
         a = self.attn
-        keys_per_split = triton.cdiv(triton.cdiv(prefix_len, a.kv_splits), a.block_n) * a.block_n
+        if n_rows < 128:
+            block_r, block_n, kv_splits, attn_warps = a.block_r, a.block_n, a.kv_splits, a.num_warps
+        else:
+            block_r, block_n, kv_splits, attn_warps = a.block_r_large, a.block_n_large, a.kv_splits_large, a.num_warps_large
+        if n_rows > MAX_FAST_ROWS:
+            raise ValueError(f"The fast loop serves at most {MAX_FAST_ROWS} attention rows, got {n_rows}.")
+        keys_per_split = triton.cdiv(triton.cdiv(prefix_len, kv_splits), block_n) * block_n
         t = self.tiles
         dt = -1.0 / num_steps
         mods = self.modulations
@@ -594,7 +621,7 @@ class FastDenoiser:
                 k_l, v_l = key[layer, :, 0], value[layer, :, 0]  # (B, n_keys, hd)
                 mod_in, mod_post = mod[2 * layer], mod[2 * layer + 1]
                 self._gemm(xn, self.w_qkv[layer], p_qkv, "qkv")
-                _attn_kernel[(batch, triton.cdiv(n_rows, a.block_r), a.kv_splits)](
+                _attn_kernel[(batch, triton.cdiv(n_rows, block_r), kv_splits)](
                     p_qkv,
                     cos,
                     sin,
@@ -616,11 +643,11 @@ class FastDenoiser:
                     SPLITS=t["qkv"].splits,
                     NUM_HEADS=nh,
                     HEAD_DIM=hd,
-                    BLOCK_R=a.block_r,
-                    BLOCK_N=a.block_n,
+                    BLOCK_R=block_r,
+                    BLOCK_N=block_n,
                     BLOCK_S=max(16, triton.next_power_of_2(horizon)),
-                    KV_SPLITS=a.kv_splits,
-                    num_warps=a.num_warps,
+                    KV_SPLITS=kv_splits,
+                    num_warps=attn_warps,
                     num_stages=a.num_stages,
                 )
                 _attn_combine_kernel[(batch, n_rows)](
@@ -632,7 +659,7 @@ class FastDenoiser:
                     att.stride(0),
                     NUM_HEADS=nh,
                     HEAD_DIM=hd,
-                    KV_SPLITS=a.kv_splits,
+                    KV_SPLITS=kv_splits,
                     num_warps=4,
                 )
                 self._gemm(att, self.w_o[layer], p_o, "o")

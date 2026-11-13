@@ -27,6 +27,7 @@ which are also the sizes the graphs are captured for.
 from __future__ import annotations
 
 import gc
+import json
 import os
 from pathlib import Path
 
@@ -50,6 +51,8 @@ pytestmark = [
 MODEL_PATH = os.environ.get("PI05_PARITY_MODEL_PATH", "lerobot/pi05_base")
 DTYPES = os.environ.get("PI05_BATCH_PARITY_DTYPES", "float32,bfloat16").split(",")
 SIZES = tuple(sorted({int(size) for size in os.environ.get("PI05_BATCH_PARITY_SIZES", "1,2,4,8,16,32").split(",")}))
+# Optional stage ``custom_pipeline_args`` as JSON, e.g. the P0 switches and the iscadev fast path.
+PIPELINE_ARGS = json.loads(os.environ.get("PI05_BATCH_PARITY_PIPELINE_ARGS", "{}"))
 DEPLOY_CONFIG = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05.yaml"
 
 # float32: how far a row of a batch may move from its request alone (relative
@@ -137,6 +140,7 @@ def pipeline(request):
         model_config=_deploy_model_config(),
         enforce_eager=False,
         max_num_seqs=max(SIZES),
+        custom_pipeline_args=PIPELINE_ARGS,
     )
     # Constructed the way DiffusersLoader does it: under the serving dtype as
     # torch's default dtype, which is also when the CUDA graphs are captured.
