@@ -162,7 +162,17 @@ A100-SXM4-80GB at its default clocks (1410 MHz at batch 1; check that `nvidia-sm
 
 At batch 1 of the low-latency deployment the stages, timed one by one, go from 4.5 to 3.8 ms (prefix embedding), 15.1 to 12.8 ms (prefill) and 14.2 to 9.7 ms (denoising); replaying the request as one graph instead of one per region saves another 0.35 ms. Served over the OpenPI websocket (`e2e_latency_pi05.py --views 2`, 224-px frames, `mp` executor) the round trip is 30.5 ms p50 against 38.0 ms.
 
-The rows above batch 1 are model-level batches (`sample_actions` over B requests, as `bench_batch_pi05.py` forms them): serving them needs `Pi05Pipeline` to accept the engine's request batches, which it does not do yet, so the engine rejects `max_num_seqs` above 1 for it. Batching would buy little throughput anyway: the prefill is compute-bound from one request on (12.8 ms at batch 1, 1379 ms at batch 128, 78% of that request), so only the denoising loop gains from a larger launch (9.7 ms at batch 1, 97.6 ms at 128). The loop alone, fused per-step kernels against the fast loop (`tune_fast_loop_pi05.py`): 13.6 / 19.9 / 41.9 / 138.0 ms against 9.7 / 14.5 / 28.2 / 95.7 ms at batch 1 / 8 / 32 / 128.
+The rows above batch 1 are `sample_actions` over B requests, as `bench_batch_pi05.py` forms them. Batching buys little throughput: the prefill is compute-bound from one request on (12.8 ms at batch 1, 1379 ms at batch 128, 78% of that request), so only the denoising loop gains from a larger launch (9.7 ms at batch 1, 97.6 ms at 128). The loop alone, fused per-step kernels against the fast loop (`tune_fast_loop_pi05.py`): 13.6 / 19.9 / 41.9 / 138.0 ms against 9.7 / 14.5 / 28.2 / 95.7 ms at batch 1 / 8 / 32 / 128.
+
+Served, the engine runs the requests that are queued together as one batch when the stage sets `max_num_seqs` above 1. LIBERO closed loop with OpenPI's `pi05_libero` checkpoint on the fast path, the same 2000 episodes (4 suites x 10 tasks x 50 trials) and per-call noise seeds for every server, 10 actions executed per call, simulators rendering on other GPUs:
+
+| server | simulators | batch sizes run | success | calls/s | mean round trip | wall |
+| --- | ---: | --- | ---: | ---: | ---: | ---: |
+| `max_num_seqs: 1` | 32 | 1 | 96.40% (1928/2000) | 27.7 | 372 ms | 19.5 min |
+| `max_num_seqs: 32`, no wait | 32 | mean 2.5; 76% of requests in batches of 2 to 15 | 96.75% (1935/2000) | 37.1 | 150 ms | 14.5 min |
+| `max_num_seqs: 32`, `request_batch_max_wait_ms: 2000` | 96 | mean 18.5; 47% of requests in batches of 32, 36% in 16 to 31 | 96.05% (1921/2000) | 44.1 | 846 ms | 12.3 min |
+
+Episode by episode the servers differ on 63 (one request at a time against no wait), 87 and 86 episodes of 2000, each way about equally (28:35, 47:40, 50:36), and none of the three differences is significant (McNemar p = 0.38, 0.45, 0.13). The request rate is not set: every simulator sends its next request when it has executed the chunk it got, so the simulators (96 cores) capped the third server below the 68 requests/s that batches of 32 could serve, and the engine starts a batch once no request has arrived for 50 ms.
 
 Numerics: the same dtypes as the bfloat16 path (bfloat16 GEMMs and K/V, float32 residual stream, softmax and accumulation) with other rounding points and reduction orders. A chunk moves by up to 1.6% (relative L2) from the baseline's on the test's requests, where bfloat16 itself moves it by up to 6% from float32. LIBERO closed-loop success with OpenPI's `pi05_libero` checkpoint (10-token chunks) served through the OpenPI endpoint, 4 suites × 10 tasks × 10 trials per arm and seed:
 
