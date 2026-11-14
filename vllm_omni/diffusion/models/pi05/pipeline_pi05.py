@@ -448,22 +448,26 @@ class Pi05Pipeline(nn.Module):
 
     def _sample(self, requests: list[OmniDiffusionRequest], observations: list[dict]) -> list[DiffusionOutput]:
         """The chunks of ``requests``, run as one batch: their observations
-        preprocessed one by one and stacked (the processor gives every request
-        the deployed shapes: ``max_cameras`` slots, ``tokenizer_max_length``
-        tokens), the denoising steps shared, the noise drawn per request."""
+        preprocessed into one stacked set of inputs (the processor gives every
+        request the deployed shapes: ``max_cameras`` slots,
+        ``tokenizer_max_length`` tokens), the denoising steps shared, the noise
+        drawn per request."""
         steps = [self._num_steps(req) for req in requests]
         if any(num_steps != steps[0] for num_steps in steps):
             raise ValueError(f"The requests of a batch must share num_inference_steps, got {steps}.")
         trace_ids = [getattr(req, "request_id", None) for req in requests] if latency_trace.ENABLED else []
-        parts = [self.processor.build_model_inputs(obs) for obs in observations]
+        if len(observations) == 1:
+            images, image_masks, lang_tokens, lang_masks = self.processor.build_model_inputs(observations[0])
+        else:
+            images, image_masks, lang_tokens, lang_masks = self.processor.build_batch_inputs(observations)
         generators = [req.sampling_params.generator for req in requests]
         for trace_id in trace_ids:
             latency_trace.mark(trace_id, "model_start")
         actions = self.model.sample_actions(
-            images=[torch.cat([part[0][cam] for part in parts]) for cam in range(len(parts[0][0]))],
-            image_masks=[torch.cat([part[1][cam] for part in parts]) for cam in range(len(parts[0][1]))],
-            lang_tokens=torch.cat([part[2] for part in parts]),
-            lang_masks=torch.cat([part[3] for part in parts]),
+            images=images,
+            image_masks=image_masks,
+            lang_tokens=lang_tokens,
+            lang_masks=lang_masks,
             num_steps=steps[0],
             # One request's generator as it is; a batch's as a list, so that each
             # request draws its own noise (``None`` entries draw from the default).

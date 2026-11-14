@@ -24,6 +24,7 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import numpy as np
@@ -1626,6 +1627,64 @@ def test_build_model_inputs_preserves_missing_middle_camera_slot(explicit_none):
     torch.testing.assert_close(slots[0], torch.full_like(slots[0], -1.0))
     torch.testing.assert_close(slots[1], torch.full_like(slots[1], -1.0))
     torch.testing.assert_close(slots[2], torch.full_like(slots[2], 1.0))
+
+
+class _LengthTokenizer:
+    """Ids that tell the prompts apart: the prompt's length, then padding."""
+
+    def __call__(self, text, **kwargs):
+        length = kwargs["max_length"]
+        return {"input_ids": [len(text)] + [0] * (length - 1), "attention_mask": [1] * 3 + [0] * (length - 3)}
+
+
+@pytest.mark.parametrize("inference_mode", [False, True], ids=["grad_mode", "inference_mode"])
+def test_build_batch_inputs_is_every_observation_stacked(inference_mode):
+    """A batch's inputs are bit for bit the single-request inputs stacked:
+    frames to resize, model-sized uint8 frames, float frames and a missing
+    camera, each with its own prompt and state, in the batch's order."""
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3, image_resolution=(32, 32))
+    processor = Pi05Processor(config, _LengthTokenizer(), torch.device("cpu"))
+    rng = np.random.default_rng(0)
+    first, second, third = _EXPECTED_CAMERA_ORDER
+
+    def frame(size, dtype=np.uint8):
+        if dtype == np.uint8:
+            return rng.integers(0, 256, (size, size, 3), dtype=np.uint8)
+        return rng.random((size, size, 3), dtype=np.float32)
+
+    observations = [
+        {"images": {first: frame(48), second: frame(32), third: frame(40, np.float32)}, "prompt": "a"},
+        {"images": {first: frame(32), third: frame(64)}, "prompt": "a longer instruction"},
+        {"images": {second: frame(20), third: frame(32, np.float32)}, "prompt": "third"},
+        {"images": {first: frame(48), second: frame(48), third: frame(48)}, "prompt": ""},
+    ]
+    for index, observation in enumerate(observations):
+        observation["state"] = np.full(32, 0.1 * index, dtype=np.float32)
+
+    with torch.inference_mode(inference_mode):
+        singles = [processor.build_model_inputs(observation) for observation in observations]
+        for _ in range(2):  # the second call reuses the host buffer
+            images, masks, tokens, token_masks = processor.build_batch_inputs(observations)
+    assert len(images) == len(masks) == 3
+    for cam in range(3):
+        assert torch.equal(images[cam], torch.cat([single[0][cam] for single in singles]))
+        assert torch.equal(masks[cam], torch.cat([single[1][cam] for single in singles]))
+    assert masks[1].tolist() == [True, False, True, True]
+    assert torch.equal(tokens, torch.cat([single[2] for single in singles]))
+    assert torch.equal(token_masks, torch.cat([single[3] for single in singles]))
+    assert tokens[:, 0].unique().numel() == len(observations), "each row carries its own prompt"
+
+
+def test_build_batch_inputs_reports_a_bad_frame():
+    """A frame the single-request path rejects is rejected from the conversion threads too."""
+    config = Pi05Config(image_feature_keys=_EXPECTED_CAMERA_ORDER, max_cameras=3, image_resolution=(32, 32))
+    processor = Pi05Processor(config, _FakeTokenizer(), torch.device("cpu"))
+    good = {"images": {_EXPECTED_CAMERA_ORDER[0]: np.zeros((48, 48, 3), dtype=np.uint8)}, "state": np.zeros(32)}
+    bad = {"images": {_EXPECTED_CAMERA_ORDER[0]: np.full((48, 48, 3), 2.0, dtype=np.float32)}, "state": np.zeros(32)}
+    with pytest.raises(ValueError) as alone:
+        processor.build_model_inputs(bad)
+    with pytest.raises(ValueError, match=re.escape(str(alone.value))):
+        processor.build_batch_inputs([good, bad])
 
 
 def test_build_model_inputs_requires_configured_camera():

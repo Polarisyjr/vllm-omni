@@ -395,6 +395,36 @@ def test_tile_table_entries_are_all_run():
     assert covered == {id(tiles) for _, tiles in LOOP_TILES}
 
 
+# ── Batch preprocessing ──────────────────────────────────────────────
+
+
+def test_batch_inputs_are_the_requests_inputs_stacked(pipeline):
+    """``build_batch_inputs`` (frames converted on threads into one host buffer,
+    model-sized uint8 frames on the device) is bit for bit every observation's
+    ``build_model_inputs`` stacked: frames to resize, model-sized frames and a
+    missing camera in one batch, twice over the same host buffer."""
+    processor, config = pipeline.processor, pipeline.config
+    size = int(config.image_resolution[0])
+    rng = np.random.default_rng(0)
+    observations = []
+    for index in range(MAX_BATCH):
+        shapes = [(480, 640), (size, size)] if index % 2 else [(size, size), (256, 256)]
+        keys = config.image_feature_keys[: len(config.image_feature_keys) - (index % 4 == 3)]
+        images = {key: rng.integers(0, 256, size=(*shape, 3), dtype=np.uint8) for key, shape in zip(keys, shapes)}
+        state = rng.uniform(-1.0, 1.0, size=config.state_dim).astype(np.float32)
+        observations.append({"images": images, "state": state, "prompt": PROMPTS[index % len(PROMPTS)]})
+    with torch.inference_mode():
+        singles = [processor.build_model_inputs(observation) for observation in observations]
+        for _ in range(2):
+            images, masks, tokens, token_masks = processor.build_batch_inputs(observations)
+    for cam in range(config.max_cameras):
+        assert torch.equal(images[cam], torch.cat([single[0][cam] for single in singles])), f"camera {cam}"
+        assert torch.equal(masks[cam], torch.cat([single[1][cam] for single in singles]))
+    assert not masks[-1].all() and masks[-1].any(), "the batch should mix present and missing cameras"
+    assert torch.equal(tokens, torch.cat([single[2] for single in singles]))
+    assert torch.equal(token_masks, torch.cat([single[3] for single in singles]))
+
+
 # ── Whole requests ───────────────────────────────────────────────────
 
 

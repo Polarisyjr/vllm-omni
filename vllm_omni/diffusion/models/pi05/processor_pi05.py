@@ -26,6 +26,7 @@ Reference:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
@@ -526,6 +527,42 @@ def _is_image_like(value: Any) -> bool:
     return False
 
 
+def _camera_slots(robot_obs: dict, config) -> list[Any | None]:
+    """The observation's image for every camera slot of the deployed model, in
+    ``config.image_feature_keys`` order: ``None`` for a camera the observation
+    does not provide and for the slots past the declared cameras."""
+    max_cameras = config.max_cameras
+    feature_keys = config.image_feature_keys or []
+    obs_images = _extract_images(robot_obs, config)
+    if not feature_keys:
+        # No declared camera order — fall back to whatever the obs provides,
+        # preserving insertion order.
+        feature_keys = list(obs_images.keys())[:max_cameras]
+
+    camera_keys = feature_keys[:max_cameras]
+    if all(obs_images.get(key) is None for key in camera_keys):
+        raise ValueError("π0.5 observation must provide at least one configured camera image.")
+    if not config.image_feature_keys and len(obs_images) > max_cameras:
+        raise ValueError(
+            f"π0.5 observation provides {len(obs_images)} cameras, which exceeds max_cameras={max_cameras}."
+        )
+    # A checkpoint may declare fewer named slots than the serving graph.
+    return [obs_images.get(key) for key in camera_keys] + [None] * (max_cameras - len(camera_keys))
+
+
+def _prompt_tokens(robot_obs: dict, config, tokenizer, state_norm: NormStats | None) -> tuple[list[int], list[int]]:
+    """The prompt's ``(input_ids, attention_mask)``: the task text with the
+    normalized, discretized state serialized into it."""
+    raw_state = as_state_vector(robot_obs.get("state"), config.state_dim)
+    normalized_state = apply_norm(torch.from_numpy(raw_state), state_norm).numpy()
+    prompt = build_pi05_prompt(
+        task=robot_obs.get("prompt", "") or "",
+        normalized_state=normalized_state,
+        state_num_bins=config.state_num_bins,
+    )
+    return tokenize_prompt(tokenizer, prompt, config.tokenizer_max_length)
+
+
 def _assemble_model_inputs(
     robot_obs: dict,
     config,
@@ -545,22 +582,7 @@ def _assemble_model_inputs(
     """
     image_size = int(config.image_resolution[0])
     img_proc = Pi05ImageProcessor(image_size=image_size)
-    max_cameras = config.max_cameras
-
-    feature_keys = config.image_feature_keys or []
-    obs_images = _extract_images(robot_obs, config)
-    if not feature_keys:
-        # No declared camera order — fall back to whatever the obs provides,
-        # preserving insertion order.
-        feature_keys = list(obs_images.keys())[:max_cameras]
-
-    camera_keys = feature_keys[:max_cameras]
-    if all(obs_images.get(key) is None for key in camera_keys):
-        raise ValueError("π0.5 observation must provide at least one configured camera image.")
-    if not config.image_feature_keys and len(obs_images) > max_cameras:
-        raise ValueError(
-            f"π0.5 observation provides {len(obs_images)} cameras, which exceeds max_cameras={max_cameras}."
-        )
+    slots = _camera_slots(robot_obs, config)
 
     if constants is not None and (constants.image_size != image_size or constants.device != device):
         constants = None
@@ -580,8 +602,7 @@ def _assemble_model_inputs(
     image_masks: list[torch.Tensor] = []
     device_slots: list[int] = []
     device_frames: list[np.ndarray] = []
-    for key in camera_keys:
-        image = obs_images.get(key)
+    for image in slots:
         if image is None:
             images.append(empty_slot())
         elif convert_on_device and _is_model_sized_uint8_frame(image, image_size):
@@ -596,20 +617,8 @@ def _assemble_model_inputs(
         for slot, tensor in zip(device_slots, _uint8_frames_to_unit_range_on_device(device_frames, device, divisor)):
             images[slot] = tensor
 
-    # A checkpoint may declare fewer named slots than the serving graph.
-    while len(images) < max_cameras:
-        images.append(empty_slot())
-        image_masks.append(slot_mask(False))
-
     # Normalize and serialize the state into the tokenized prompt.
-    raw_state = as_state_vector(robot_obs.get("state"), config.state_dim)
-    normalized_state = apply_norm(torch.from_numpy(raw_state), state_norm).numpy()
-    prompt = build_pi05_prompt(
-        task=robot_obs.get("prompt", "") or "",
-        normalized_state=normalized_state,
-        state_num_bins=config.state_num_bins,
-    )
-    ids, attn = tokenize_prompt(tokenizer, prompt, config.tokenizer_max_length)
+    ids, attn = _prompt_tokens(robot_obs, config, tokenizer, state_norm)
     if device.type == "cuda":
         # One transfer for ids and mask instead of two list-to-device tensors.
         lang = torch.from_numpy(np.asarray([ids, attn], dtype=np.int64)).to(device=device)
@@ -639,6 +648,8 @@ class Pi05Processor:
         self._state_norm = build_norm_stats(config.norm_stats, "state")
         self._action_norm = build_norm_stats(config.norm_stats, "action")
         self._input_constants: _ModelInputConstants | None = None
+        self._batch_image_buffers: dict[tuple[int, ...], torch.Tensor] = {}
+        self._batch_image_pool: ThreadPoolExecutor | None = None
         if device.type == "cuda":
             self._warm_up_device_inputs()
         self.relative_actions = Pi05RelativeActions(
@@ -682,6 +693,87 @@ class Pi05Processor:
             self._input_constants = _ModelInputConstants(int(self.config.image_resolution[0]), self.device)
         return _assemble_model_inputs(
             robot_obs, self.config, self.tokenizer, self.device, self._state_norm, self._input_constants
+        )
+
+    # Threads that convert and resize the camera frames of a formed batch. More
+    # do not help: 64 frames of 256 px take 53 ms on one thread, 18 ms on 4 and
+    # 32 ms on 8 to 32.
+    BATCH_IMAGE_THREADS = 4
+
+    def build_batch_inputs(self, observations: list[dict]):
+        """The observations of a formed batch → the inputs of one ``sample_actions``
+        call: bit for bit every observation's ``build_model_inputs`` stacked.
+
+        One request at a time, a batch of 32 spends 2 ms per request with
+        frames to resize, most of it in one thread's resize. Here those frames
+        are converted and resized on ``BATCH_IMAGE_THREADS`` threads (the
+        resize releases the GIL) straight into one host buffer, which crosses
+        to the device in a single copy. Model-sized uint8 frames cross as
+        bytes in another and are converted on the device, as for one request.
+        The prompts are tokenized in order and cross in a third.
+        """
+        config, device = self.config, self.device
+        image_size = int(config.image_resolution[0])
+        img_proc = Pi05ImageProcessor(image_size=image_size)
+        slots = [_camera_slots(obs, config) for obs in observations]
+        batch, cameras = len(observations), config.max_cameras
+        convert_on_device = device.type == "cuda"
+
+        present = np.zeros((cameras, batch), dtype=np.bool_)
+        host_jobs: list[tuple[int, int, Any]] = []
+        device_slots: list[tuple[int, int]] = []
+        device_frames: list[np.ndarray] = []
+        for row, images in enumerate(slots):
+            for cam, image in enumerate(images):
+                if image is None:
+                    continue
+                present[cam, row] = True
+                if convert_on_device and _is_model_sized_uint8_frame(image, image_size):
+                    device_slots.append((cam, row))
+                    device_frames.append(image)
+                else:
+                    host_jobs.append((cam, row, image))
+
+        shape = (cameras, batch, 3, image_size, image_size)
+        if host_jobs:
+            host = self._batch_image_buffers.get(shape)
+            if host is None:
+                # A normal tensor even under the pipeline's inference mode: the
+                # threads that fill it are not in that mode.
+                with torch.inference_mode(False):
+                    host = torch.empty(shape, dtype=torch.float32, pin_memory=device.type == "cuda")
+                self._batch_image_buffers[shape] = host
+
+            def convert(job) -> None:
+                cam, row, image = job
+                host[cam, row].copy_(img_proc.preprocess_single(image)[0])
+
+            if self._batch_image_pool is None:
+                self._batch_image_pool = ThreadPoolExecutor(self.BATCH_IMAGE_THREADS, thread_name_prefix="pi05-frames")
+            list(self._batch_image_pool.map(convert, host_jobs))  # raises a frame's validation error here
+            images = host.to(device=device)
+        else:
+            images = torch.empty(shape, dtype=torch.float32, device=device)
+        masks = torch.from_numpy(present).to(device=device)
+        # The empty image of ``make_empty_image`` in every slot without a frame.
+        images[~masks] = -1.0
+        if device_frames:
+            if self._input_constants is None:
+                self._input_constants = _ModelInputConstants(image_size, device)
+            converted = _uint8_frames_to_unit_range_on_device(
+                device_frames, device, self._input_constants.uint8_divisor
+            )
+            where = torch.tensor(device_slots, dtype=torch.long, device=device)
+            images[where[:, 0], where[:, 1]] = torch.cat(converted)
+
+        tokens = [_prompt_tokens(obs, config, self.tokenizer, self._state_norm) for obs in observations]
+        lang = np.asarray([[ids for ids, _ in tokens], [attn for _, attn in tokens]], dtype=np.int64)
+        lang = torch.from_numpy(lang).to(device=device)
+        return (
+            [images[cam] for cam in range(cameras)],
+            [masks[cam] for cam in range(cameras)],
+            lang[0],
+            lang[1] != 0,
         )
 
     def build_model_outputs(self, actions: torch.Tensor, robot_obs: dict) -> np.ndarray:
