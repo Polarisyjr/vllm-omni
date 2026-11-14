@@ -82,11 +82,9 @@ PROMPTS = (
 VISION_TOLERANCE = 1e-2  # image features: 4.7e-3
 PREFIX_TOLERANCE = 4e-2  # K/V of all 18 layers: 9.8e-3 / 1.9e-2; final hidden state: 1.6e-2
 # (relative L2, largest absolute difference) of an action chunk.
-LOOP_TOLERANCE = (5e-3, 1.5e-2)  # the denoising loop over one cache: 2.1e-3, 6.6e-3
-REQUEST_TOLERANCE = (
-    3e-2,
-    6e-2,
-)  # a whole request: 1.6e-2, 3.2e-2; a batch row against its request alone: 1.3e-2, 2.5e-2
+LOOP_TOLERANCE = (5e-3, 1.5e-2)  # the denoising loop over one cache, 1 to 128 requests: 2.2e-3, 7.7e-3
+# A whole request: 1.6e-2, 3.2e-2; a row of a batch of 2 to 8 against its request alone: 1.8e-2, 2.1e-2.
+REQUEST_TOLERANCE = (3e-2, 6e-2)
 
 
 def _resolve_checkpoint_dir() -> str:
