@@ -24,7 +24,6 @@ behaviour still produces a well-shaped, finite action chunk:
 from __future__ import annotations
 
 import logging
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -39,7 +38,7 @@ from vllm_omni.diffusion.models.pi05.config import (
     resolve_excluded_action_indices,
 )
 from vllm_omni.diffusion.models.pi05.cuda_graph_pi05 import Pi05CUDAGraphs
-from vllm_omni.diffusion.models.pi05.fast_pi05 import MAX_FAST_ROWS, fast_loop_max_batch
+from vllm_omni.diffusion.models.pi05.fast_pi05 import LOOP_TILES, loop_tiles
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import (
     GemmaVariantConfig,
     Pi05AdaRMSNorm,
@@ -95,19 +94,28 @@ def test_fast_path_option_rejects_what_it_cannot_run(args):
         Pi05RuntimeOptions.from_pipeline_args(args)
 
 
-@pytest.mark.parametrize(
-    ("chunk", "max_batch", "expected"),
-    [(10, 1, 1), (10, 4, 4), (10, 32, 4), (20, 8, 2), (40, 8, 1), (50, 8, 0)],
-)
-def test_fast_loop_serves_launches_up_to_its_row_limit(chunk, max_batch, expected):
-    """The fast loop takes ``requests x heads x action tokens`` up to ``MAX_FAST_ROWS``."""
-    heads = 8
-    attention = SimpleNamespace(config=SimpleNamespace(num_attention_heads=heads))
-    expert = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)]))
-    model = SimpleNamespace(action_horizon=chunk, paligemma_with_expert=SimpleNamespace(gemma_expert=expert))
-    served = fast_loop_max_batch(model, max_batch)
-    assert served == expected
-    assert served * chunk * heads <= MAX_FAST_ROWS
+def test_fast_loop_tiles_cover_every_launch_size():
+    """A launch runs the last ``LOOP_TILES`` entry that starts at or below its rows."""
+    starts = [rows_from for rows_from, _ in LOOP_TILES]
+    assert starts[0] == 1 and starts == sorted(set(starts))
+    for index, (rows_from, tiles) in enumerate(LOOP_TILES):
+        last = starts[index + 1] - 1 if index + 1 < len(starts) else 10**6
+        assert loop_tiles(rows_from) is tiles
+        assert loop_tiles(last) is tiles
+
+
+@pytest.mark.parametrize("rows_from,tiles", LOOP_TILES, ids=lambda value: str(value) if isinstance(value, int) else "")
+def test_fast_loop_tiles_fit_the_action_expert(rows_from, tiles):
+    """The GEMM kernels load whole K tiles of a split, and only an unsplit
+    gate/up GEMM fuses the GELU epilogue (the ``gemma_300m`` expert's widths)."""
+    for name, in_features in (("qkv", 1024), ("o", 2048), ("gateup", 1024), ("down", 4096)):
+        gemm = getattr(tiles, name)
+        assert in_features % gemm.splits == 0 and (in_features // gemm.splits) % gemm.block_k == 0, name
+        assert gemm.block_n & (gemm.block_n - 1) == 0 and gemm.block_k & (gemm.block_k - 1) == 0, name
+    assert tiles.gateup.splits == 1
+    for size in (tiles.block_m, tiles.attn.block_r, tiles.attn.block_n):
+        assert size >= 16 and size & (size - 1) == 0
+    assert tiles.attn.kv_splits >= 1
 
 
 def _p0_vision_model():

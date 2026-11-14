@@ -5,7 +5,7 @@
 Loads the real checkpoint once in bfloat16 through ``Pi05Pipeline`` under the
 low-latency deployment (``vllm_omni/deploy/pi05_low_latency.yaml``: 2 camera
 slots, 100 text tokens, 10-token chunks, the P0 switches and the fast path),
-with the graphs captured for 1, 2 and 4 requests. One model serves every path:
+with the graphs captured for 1, 2, 4 and 8 requests. One model serves every path:
 the fast hooks and the graphs are taken off it to run the fused kernels the
 fast path replaces (the baseline), which read the same weights.
 
@@ -16,7 +16,7 @@ fast path replaces (the baseline), which read the same weights.
   bit, and stays within bfloat16 rounding of the baseline.
 * Formed batches on the fast loop: each row against its request alone, no
   cross-request contamination, and the loop's rows bit for bit independent of
-  the rest of the batch.
+  the rest of the launch at every entry of its tile table (10 to 1280 rows).
 * The calls the fast loop does not serve (another step count) still run.
 
 Needs a CUDA GPU and the real checkpoint::
@@ -28,6 +28,7 @@ Needs a CUDA GPU and the real checkpoint::
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import os
 from contextlib import contextmanager
@@ -41,7 +42,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from tests.helpers.mark import hardware_marks
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.diffusion.models.pi05.fast_pi05 import MAX_FAST_ROWS, fast_loop_max_batch
+from vllm_omni.diffusion.models.pi05.fast_pi05 import LOOP_TILES, FastDenoiser, loop_tiles
 from vllm_omni.diffusion.models.pi05.modeling_pi05 import make_att_2d_masks, prepare_attention_masks_4d
 from vllm_omni.diffusion.models.pi05.pipeline_pi05 import Pi05Pipeline
 
@@ -54,9 +55,14 @@ pytestmark = [
 
 MODEL_PATH = os.environ.get("PI05_PARITY_MODEL_PATH", "lerobot/pi05_base")
 DEPLOY_CONFIG = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "pi05_low_latency.yaml"
-# The graphs are captured for 1, 2 and 4 requests; 3 runs on the graphs of 4.
-MAX_BATCH = 4
-NUM_REQUESTS = 8
+# The graphs are captured for 1, 2, 4 and 8 requests; 3 and 6 run on the next larger ones.
+MAX_BATCH = 8
+CAPTURED = (1, 2, 4, 8)
+BATCHES = (2, 3, 4, 6, 8)
+# One more than a batch holds: the last one replaces a row in the contamination test.
+NUM_REQUESTS = MAX_BATCH + 1
+# Launches that reach the rest of the fast loop's tile table (requests of 10 tokens).
+LARGE_LAUNCHES = (16, 32, 64, 128)
 
 PROMPTS = (
     "turn on the stove",
@@ -219,8 +225,7 @@ def test_fast_path_is_installed(pipeline):
     assert model.cuda_graphs is not None
     assert backbone.fast_vision is not None and backbone.fast_prefix is not None
     assert model.fast_denoiser is not None and model.fast_denoiser.max_batch == MAX_BATCH
-    rows = model.action_horizon * model.fast_denoiser.num_heads
-    assert fast_loop_max_batch(model, 64) == MAX_FAST_ROWS // rows
+    assert model.fast_denoiser.tiles is None, "serving picks the tiles of each launch from LOOP_TILES"
 
 
 # ── Components ───────────────────────────────────────────────────────
@@ -308,11 +313,23 @@ def _fused_loop(model, pad_masks, cache, context, noise) -> torch.Tensor:
     return x_t
 
 
-@pytest.mark.parametrize("batch", [1, 2, 3, MAX_BATCH], ids=lambda batch: f"batch={batch}")
+def _reversed(model, cache, context, noise):
+    """The same launch with its requests in reverse order."""
+    batch = noise.shape[0]
+    order = torch.arange(batch - 1, -1, -1, device=noise.device)
+    flipped = model.new_kv_cache(batch, cache.prefix_len)
+    flipped.key.copy_(cache.key[:, order])
+    flipped.value.copy_(cache.value[:, order])
+    fields = {field.name: getattr(context, field.name) for field in dataclasses.fields(context)}
+    assert all(value.shape[0] == batch for value in fields.values())
+    return flipped, dataclasses.replace(context, **{name: value[order] for name, value in fields.items()}), noise[order]
+
+
+@pytest.mark.parametrize("batch", [1, *BATCHES], ids=lambda batch: f"batch={batch}")
 def test_fast_loop_matches_the_fused_loop_over_one_cache(pipeline, requests, batch):
-    """Both loops denoise the same noise over the same prefix K/V; each row of
-    the fast loop is also, bit for bit, the row its request gets from the loop
-    alone over its own cache row."""
+    """Both loops denoise the same noise over the same prefix K/V. A row of the
+    fast loop does not depend on the other rows of its launch: the requests in
+    reverse order give the same chunks bit for bit."""
     model = pipeline.model
     inputs = _batch(requests[:batch])
     with torch.inference_mode(), _path(model, fast=False):
@@ -322,13 +339,62 @@ def test_fast_loop_matches_the_fused_loop_over_one_cache(pipeline, requests, bat
         reference = _fused_loop(model, pad_masks, cache, context, inputs["noise"])
     with torch.inference_mode(), _path(model, fast=True):
         fast = model.fast_denoise(inputs["noise"], cache, context)
-        first = model.fast_denoise(inputs["noise"][:1], cache.rows(1), model.prepare_denoise_context(pad_masks[:1]))
+        flipped_cache, flipped_context, flipped_noise = _reversed(model, cache, context, inputs["noise"])
+        flipped = model.fast_denoise(flipped_noise, flipped_cache, flipped_context)
     assert fast.shape == reference.shape == (batch, model.action_horizon, model.action_dim)
     _assert_within(fast.cpu(), reference.cpu(), LOOP_TOLERANCE, f"denoising loop, batch={batch}")
-    assert torch.equal(fast[:1], first), (
-        f"batch={batch}: row 0 of the fast loop differs from its request alone by up to "
-        f"{(fast[:1].double() - first.double()).abs().max().item():.3e}"
+    assert torch.equal(flipped.flip(0), fast), (
+        f"batch={batch}: reversing the requests moved a chunk by up to "
+        f"{(flipped.flip(0).double() - fast.double()).abs().max().item():.3e}"
     )
+
+
+@pytest.fixture(scope="module")
+def large_launches(pipeline, requests):
+    """A fast loop for launches up to the largest in ``LARGE_LAUNCHES``, and the
+    prefix K/V, context and masks of ``MAX_BATCH`` requests to repeat into them."""
+    model = pipeline.model
+    with torch.inference_mode(), _path(model, fast=False):
+        embs, pad_masks, mask, position_ids, rotary = _prefix_inputs(model, _batch(requests[:MAX_BATCH]))
+        _, cache = _prefix_forward(model, embs, mask, position_ids, rotary, kv_only=True)
+    denoiser = FastDenoiser(model, max_batch=max(LARGE_LAUNCHES))
+    yield denoiser, cache, pad_masks
+    del denoiser
+    gc.collect()
+    torch.accelerator.empty_cache()
+
+
+@pytest.mark.parametrize("batch", LARGE_LAUNCHES, ids=lambda batch: f"batch={batch}")
+def test_fast_loop_serves_large_launches(pipeline, requests, large_launches, batch):
+    """Launches of 16 to 128 requests run the remaining entries of the tile
+    table. The launch repeats the same ``MAX_BATCH`` requests: against the
+    fused loop within ``LOOP_TOLERANCE``, and every repeat of a request is its
+    first copy bit for bit."""
+    model = pipeline.model
+    denoiser, cache, pad_masks = large_launches
+    repeats = batch // MAX_BATCH
+    assert loop_tiles(batch * model.action_horizon) is not loop_tiles(MAX_BATCH * model.action_horizon)
+    with torch.inference_mode(), _path(model, fast=False):
+        big = model.new_kv_cache(batch, cache.prefix_len)
+        big.key.copy_(cache.key.repeat(1, repeats, 1, 1, 1))
+        big.value.copy_(cache.value.repeat(1, repeats, 1, 1, 1))
+        pad = pad_masks.repeat(repeats, 1)
+        context = model.prepare_denoise_context(pad)
+        noise = torch.cat([request.noise for request in requests[:MAX_BATCH]]).repeat(repeats, 1, 1)
+        reference = _fused_loop(model, pad, big, context, noise)
+        fast = denoiser.run(noise.clone(), big, context)
+    _assert_within(fast.cpu(), reference.cpu(), LOOP_TOLERANCE, f"denoising loop, batch={batch}")
+    assert torch.equal(fast, fast[:MAX_BATCH].repeat(repeats, 1, 1)), (
+        f"batch={batch}: a repeated request differs from its first copy by up to "
+        f"{(fast.double() - fast[:MAX_BATCH].repeat(repeats, 1, 1).double()).abs().max().item():.3e}"
+    )
+
+
+def test_tile_table_entries_are_all_run():
+    """The launches above cover every entry of ``LOOP_TILES`` (10-token chunks)."""
+    launches = [1, *BATCHES, *LARGE_LAUNCHES]
+    covered = {id(loop_tiles(batch * 10)) for batch in launches}
+    assert covered == {id(tiles) for _, tiles in LOOP_TILES}
 
 
 # ── Whole requests ───────────────────────────────────────────────────
@@ -381,18 +447,18 @@ def test_other_step_count_runs_off_the_fast_loop(pipeline, requests):
 # ── Formed batches ───────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("size", [2, 3, MAX_BATCH], ids=lambda size: f"batch={size}")
+@pytest.mark.parametrize("size", BATCHES, ids=lambda size: f"batch={size}")
 def test_formed_batch_rows_match_the_requests_alone(pipeline, requests, alone, size):
     """A batch of a captured size replays its request graph; one between two
     sizes runs its loop on the next larger graph. Each row is its request's
-    chunk within bfloat16 rounding (the prefix GEMMs of a batch round
-    differently than a request's alone)."""
+    chunk within bfloat16 rounding (the prefix GEMMs and the loop's tiles of
+    a batch round differently than a request's alone)."""
     model = pipeline.model
     rows = requests[:size]
     replays_before = model.cuda_graphs.num_replays.copy()
     actual = _sample(model, _batch(rows))
     replays = model.cuda_graphs.num_replays - replays_before
-    assert replays["request" if size in (2, MAX_BATCH) else "denoise_all"] == 1, dict(replays)
+    assert replays["request" if size in CAPTURED else "denoise_all"] == 1, dict(replays)
     assert actual.shape == (size, pipeline.config.chunk_size, pipeline.config.max_action_dim)
     for position, request in enumerate(rows):
         _assert_within(
@@ -403,7 +469,7 @@ def test_formed_batch_rows_match_the_requests_alone(pipeline, requests, alone, s
         )
 
 
-@pytest.mark.parametrize("size", [2, 3, MAX_BATCH], ids=lambda size: f"batch={size}")
+@pytest.mark.parametrize("size", BATCHES, ids=lambda size: f"batch={size}")
 def test_replacing_one_row_leaves_the_others_bit_identical(pipeline, requests, alone, size):
     """No cross-request contamination on the fast path."""
     model = pipeline.model

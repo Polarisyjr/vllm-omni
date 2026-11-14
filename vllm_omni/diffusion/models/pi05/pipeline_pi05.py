@@ -332,23 +332,25 @@ class Pi05Pipeline(nn.Module):
         batch_sizes = graph_batch_sizes(getattr(od_config, "max_num_seqs", 1))
         if self.runtime_options.fast_path:
             from vllm_omni.diffusion.models.pi05.fast_pi05 import (
+                LOOP_MAX_CHUNK,
                 FastDenoiser,
                 FastPrefix,
                 FastVision,
-                fast_loop_max_batch,
             )
 
             backbone = self.model.paligemma_with_expert
-            loop_batch = fast_loop_max_batch(self.model, max(batch_sizes))
-            if loop_batch:
-                self.model.fast_denoiser = FastDenoiser(self.model, max_batch=loop_batch)
+            fast_loop = self.model.action_horizon <= LOOP_MAX_CHUNK
+            if fast_loop:
+                self.model.fast_denoiser = FastDenoiser(self.model, max_batch=max(batch_sizes))
             backbone.fast_prefix = FastPrefix(self.model)
             if self.vision_options.precision == "selective_bf16":
                 backbone.fast_vision = FastVision(self.model)
             logger.info(
-                "Pi05Pipeline: fast prefix forward%s installed; the fast denoising loop serves batches up to %d.",
-                " and vision tower" if backbone.fast_vision is not None else "",
-                loop_batch,
+                "Pi05Pipeline: fast path installed: prefix forward%s%s.",
+                ", vision tower" if backbone.fast_vision is not None else "",
+                f", denoising loop for batches up to {max(batch_sizes)}"
+                if fast_loop
+                else f"; {self.model.action_horizon}-token chunks keep the per-step denoising kernels",
             )
         graphs = Pi05CUDAGraphs(self.model, batch_sizes=batch_sizes)
         start = time.perf_counter()

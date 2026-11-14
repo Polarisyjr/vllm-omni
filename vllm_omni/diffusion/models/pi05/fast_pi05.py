@@ -11,17 +11,18 @@ Three drop-in replacements for parts of ``sample_actions``, installed by
 * ``FastVision``: the SigLIP encoder.
 
 **Denoising loop.** The action expert runs on ``chunk_size`` rows per request
-(10-50), so every GEMM of a denoising step is a weight stream: the time of a
-step is set by how fast 622 MB of expert weights (bf16) and the KV cache move
-through the GPU and by the number of kernels launched, not by FLOPs. The
-kernels are shaped for that:
+(10-50), so for one request every GEMM of a denoising step is a weight stream:
+the time of a step is set by how fast 622 MB of expert weights (bf16) and the
+KV cache move through the GPU and by the number of kernels launched, not by
+FLOPs. The kernels are shaped for that, and their tiles widen with the launch
+as formed batches turn the GEMMs into compute (``LOOP_TILES``):
 
-* ``_skinny_gemm_kernel``: a split-K GEMM over ``BLOCK_M = 16`` rows that
-  writes float32 partial sums, so that enough CTAs stream the weight in
-  parallel to reach a useful fraction of HBM bandwidth. The reduction over
-  the splits is folded into the kernel that consumes the result (attention,
-  gated residual + AdaRMS norm, output head). The gate/up GEMM runs unsplit
-  with ``gelu(gate) · up`` as its epilogue.
+* ``_skinny_gemm_kernel``: a split-K GEMM over a tile of rows that writes
+  float32 partial sums, so that enough CTAs stream the weight in parallel to
+  reach a useful fraction of HBM bandwidth. The reduction over the splits is
+  folded into the kernel that consumes the result (attention, gated residual
+  + AdaRMS norm, output head). The gate/up GEMM runs unsplit with
+  ``gelu(gate) · up`` as its epilogue.
 * ``_attn_kernel`` / ``_attn_combine_kernel``: one flash-decoding style
   kernel for the single-KV-head attention, split over the prefix keys of the
   cache row. It reads Q and the suffix K/V straight from the QKV partials
@@ -30,11 +31,13 @@ kernels are shaped for that:
   so a whole schedule of steps runs with no host work in between and the
   loop is captured as one CUDA graph.
 
-Eight kernels per layer, against the nine of the fused path, each shaped for
-10-50 rows. Numerics: bfloat16 weights and activations, float32 residual stream,
-accumulation and softmax, as the eager bfloat16 path; the reduction orders differ from it.
-Every row is computed independently of the other rows of its launch, so a
-request gets the same bits from the loop alone and in a formed batch.
+Eight kernels per layer, against the nine of the fused path. Numerics:
+bfloat16 weights and activations, float32 residual stream, accumulation and
+softmax, as the eager bfloat16 path; the reduction orders differ from it.
+Every row is computed independently of the other rows of its launch. The
+tiles follow the size of the launch (``LOOP_TILES``, 1 to 128 requests of a
+10-token chunk), so the loop serves any formed batch; a request's bits depend
+on the size of the launch it is in, never on the other requests.
 
 **Prefix forward and vision tower.** Compute-bound GEMM chains at 512-612 rows,
 where cuBLAS is the fastest GEMM; the kernels fuse what surrounds the GEMMs
@@ -411,6 +414,8 @@ if HAS_TRITON:
 
 @dataclass(frozen=True)
 class GemmTiles:
+    """Tiles of one split-K GEMM: output columns and K per program, K splits."""
+
     block_n: int
     block_k: int
     splits: int
@@ -420,80 +425,109 @@ class GemmTiles:
 
 @dataclass(frozen=True)
 class AttnTiles:
-    """Tiles of the denoising attention, per request (``heads · action tokens`` query rows).
+    """Tiles of the denoising attention.
 
-    ``kv_splits`` programs share a row tile's keys. A split takes a whole
-    number of ``block_n`` key blocks, so the prefix fills only the first
-    ``ceil(prefix_len / keys_per_split)`` of them and the last split always
-    adds the suffix keys. At the 612-key prefix of 2 cameras and 100 text
-    tokens that is 5 prefix splits, 2 idle ones and one with the suffix keys
-    alone: as fast as 6 or 9 splits within 0.1 ms per request, and 0.9 ms
-    faster than 5, where the suffix keys follow 100 prefix keys in one program.
+    ``kv_splits`` programs share the keys of a ``block_r`` tile of query rows.
+    A split takes a whole number of ``block_n`` key blocks, so the prefix keys
+    fill the first ``ceil(prefix_len / keys_per_split)`` splits and the last
+    split always adds the suffix keys (at a 612-key prefix and 6 splits: 5
+    prefix splits and one with the suffix keys alone).
     """
 
     block_r: int = 16
     block_n: int = 64
-    kv_splits: int = 8
+    kv_splits: int = 6
     num_warps: int = 4
     num_stages: int = 2
-    # From 128 query rows per request on (chunks of 16 tokens or more): swept at 400 rows.
-    block_r_large: int = 16
-    num_warps_large: int = 8
-    block_n_large: int = 128
-    kv_splits_large: int = 4
 
 
-# Tiles per GEMM, from a sweep on an A100 at 10 rows (benchmarks/pi05/tune_fast_loop_pi05.py).
-DEFAULT_TILES: dict[str, GemmTiles] = {
-    "qkv": GemmTiles(64, 128, 2, 4, 4),
-    "o": GemmTiles(64, 64, 4, 4, 4),
-    "gateup": GemmTiles(64, 128, 1, 4, 3),
-    "down": GemmTiles(64, 128, 4, 4, 4),
-}
-DEFAULT_ATTN = AttnTiles()
-# ``Pi05Pipeline`` gives the fast loop launches of at most this many attention
-# rows (requests · heads · action tokens): beyond it the fused per-step kernels,
-# which tile 50-row chunks, are as fast or faster. 320 rows is 4 requests of
-# 10 tokens or 1 of 40. The kernels themselves are correct for any size.
-MAX_FAST_ROWS = 320
+@dataclass(frozen=True)
+class LoopTiles:
+    """The tiles of every kernel of the denoising loop at one launch size."""
+
+    block_m: int  # rows per GEMM program
+    qkv: GemmTiles
+    o: GemmTiles
+    gateup: GemmTiles  # one split fuses the GELU epilogue into the GEMM
+    down: GemmTiles
+    attn: AttnTiles
 
 
-def fast_loop_max_batch(model, max_batch: int) -> int:
-    """How many requests of ``model``'s chunk the fast loop serves, at most ``max_batch``; 0 for none."""
-    attention = model.paligemma_with_expert.gemma_expert.model.layers[0].self_attn
-    rows = model.action_horizon * attention.config.num_attention_heads
-    return min(max_batch, MAX_FAST_ROWS // rows)
+def _loop_tiles(block_m, qkv, o, gateup, down, attn) -> LoopTiles:
+    return LoopTiles(block_m, GemmTiles(*qkv), GemmTiles(*o), GemmTiles(*gateup), GemmTiles(*down), AttnTiles(*attn))
 
 
-def _block_m(m: int) -> int:
-    """The row tile of a launch over ``m`` rows: one tile up to 64 rows, 64-row tiles beyond."""
-    return min(64, max(16, triton.next_power_of_2(m)))
+# Tiles by launch size, as (rows from, tiles): a launch over ``rows`` action
+# tokens (requests · chunk_size) runs the last entry that starts at or below
+# it. Swept in the loop itself on an A100 at its default clocks, at 10 to 1280
+# rows of 10-token chunks, i.e. 1 to 128 requests
+# (benchmarks/pi05/tune_fast_loop_pi05.py); each entry starts halfway down to
+# the size before it. Small launches are weight streams: narrow row tiles, the
+# projections split over K, the keys split over programs. Large ones are
+# compute: wide row tiles, one split.
+# Fixed rather than autotuned, so a restart cannot pick other tiles. The
+# splits set the order of the reductions, so a request's bits depend on the
+# entry its launch falls in (not on the other requests of the launch).
+# fmt: off
+LOOP_TILES: tuple[tuple[int, LoopTiles], ...] = (
+    # (rows from, _loop_tiles(block_m, qkv, o, gate/up, down,
+    #                         attention)),
+    (1, _loop_tiles(16, (64, 128, 1, 4, 4), (32, 128, 2, 4, 4), (64, 128, 1, 8, 3), (32, 128, 2, 4, 4),
+                    (16, 64, 6, 4, 2))),
+    (16, _loop_tiles(32, (32, 128, 1, 4, 4), (32, 128, 2, 4, 4), (64, 128, 1, 8, 4), (32, 128, 2, 4, 4),
+                    (16, 64, 6, 4, 2))),
+    (31, _loop_tiles(64, (32, 128, 1, 4, 4), (32, 128, 2, 4, 4), (32, 128, 1, 4, 3), (32, 128, 2, 4, 4),
+                    (16, 64, 4, 4, 2))),
+    (61, _loop_tiles(32, (128, 128, 1, 4, 4), (32, 128, 2, 4, 4), (64, 128, 1, 4, 3), (32, 128, 2, 4, 4),
+                    (16, 64, 4, 4, 2))),
+    (121, _loop_tiles(64, (32, 64, 1, 4, 4), (64, 64, 2, 4, 4), (32, 64, 1, 4, 3), (64, 64, 2, 4, 4),
+                    (16, 64, 2, 4, 2))),
+    (241, _loop_tiles(64, (64, 64, 1, 4, 4), (64, 64, 2, 4, 4), (64, 64, 1, 4, 3), (64, 64, 2, 4, 4),
+                    (16, 64, 1, 4, 2))),
+    (481, _loop_tiles(128, (64, 64, 1, 4, 4), (64, 64, 1, 4, 4), (32, 64, 1, 4, 3), (64, 64, 1, 4, 4),
+                    (16, 64, 2, 4, 2))),
+    (961, _loop_tiles(128, (64, 64, 1, 4, 4), (64, 64, 1, 4, 4), (32, 64, 1, 4, 3), (64, 64, 1, 4, 4),
+                    (16, 64, 1, 4, 2))),
+)
+# fmt: on
+
+
+# The attention tiles above belong to short chunks: the table was swept at 10
+# tokens. On it a 50-token chunk runs the loop at 0.96x to 1.05x of the fused
+# per-step kernels (1 to 8 requests), so ``Pi05Pipeline`` gives the fast loop
+# chunks up to this length only and longer ones keep the per-step kernels
+# behind the fast prefix forward and vision tower.
+LOOP_MAX_CHUNK = 16
+
+
+def loop_tiles(rows: int) -> LoopTiles:
+    """The tiles of a launch over ``rows`` action tokens (requests · chunk_size)."""
+    tiles = LOOP_TILES[0][1]
+    for rows_from, entry in LOOP_TILES:
+        if rows >= rows_from:
+            tiles = entry
+    return tiles
 
 
 class FastDenoiser:
     """The denoising loop of one ``Pi05ForActionPrediction`` on the kernels above.
 
     Built after the weights are loaded and the AdaRMS schedule is prepared;
-    serves batches up to ``max_batch`` over scratch buffers of its own. The
-    Q/K/V and gate/up weights of every layer are concatenated once (the
-    ``nn.Linear`` modules keep views into the concatenation, so the eager path
-    reads the same storage).
+    serves batches up to ``max_batch`` over scratch buffers of its own, each
+    launch on the tiles of its size (``loop_tiles``), or every launch on
+    ``tiles`` when given (the tile sweep, which may then assign other
+    ``tiles`` that split no further). The Q/K/V and gate/up weights of every
+    layer are concatenated once (the ``nn.Linear`` modules keep views into the
+    concatenation, so the eager path reads the same storage).
     """
 
-    def __init__(
-        self,
-        model,
-        max_batch: int = 1,
-        tiles: dict[str, GemmTiles] | None = None,
-        attn: AttnTiles | None = None,
-    ):
+    def __init__(self, model, max_batch: int = 1, tiles: LoopTiles | None = None):
         if not HAS_TRITON:
             raise RuntimeError("The π0.5 fast denoising loop needs Triton.")
         expert = model.paligemma_with_expert.gemma_expert.model
         layer0 = expert.layers[0]
         self.model = model
-        self.tiles = dict(DEFAULT_TILES, **(tiles or {}))
-        self.attn = attn or DEFAULT_ATTN
+        self.tiles = tiles
         self.width = layer0.self_attn.q_proj.in_features
         self.num_heads = layer0.self_attn.config.num_attention_heads
         self.head_dim = layer0.self_attn.head_dim
@@ -547,34 +581,34 @@ class FastDenoiser:
         self.modulations = torch.stack([row.modulations[:, 0] for row in rows]).contiguous()
         assert self.modulations.shape == (self.num_steps, 2 * self.num_layers + 1, 3 * self.width)
 
-        # Scratch for the largest batch.
+        # Scratch for the largest batch and the most splits any launch uses. A
+        # launch packs its ``(splits, rows, columns)`` partials at the start
+        # of a buffer, whatever the buffer's own shape.
         m = max_batch * self.horizon
         w, nh, hd = self.width, self.num_heads, self.head_dim
         n_qkv = (nh + 2) * hd
         f32, bf16 = torch.float32, torch.bfloat16
-        t = self.tiles
-        parts = max_batch * max(self.attn.kv_splits, self.attn.kv_splits_large) * nh * self.horizon
+        every = [tiles] if tiles is not None else [entry for _, entry in LOOP_TILES]
+        parts = max_batch * max(t.attn.kv_splits for t in every) * nh * self.horizon
         self.res = torch.empty(m, w, dtype=f32, device=device)
         self.xn = torch.empty(m, w, dtype=bf16, device=device)
-        self.p_qkv = torch.empty(t["qkv"].splits, m, n_qkv, dtype=f32, device=device)
+        self.p_qkv = torch.empty(max(t.qkv.splits for t in every), m, n_qkv, dtype=f32, device=device)
         self.part_o = torch.empty(parts, hd, dtype=f32, device=device)
         self.part_m = torch.empty(parts, dtype=f32, device=device)
         self.part_l = torch.empty_like(self.part_m)
         self.att = torch.empty(m, nh * hd, dtype=bf16, device=device)
-        self.p_o = torch.empty(t["o"].splits, m, w, dtype=f32, device=device)
-        self.p_gu = torch.empty(t["gateup"].splits, m, 2 * self.mlp_dim, dtype=f32, device=device)
+        self.p_o = torch.empty(max(t.o.splits for t in every), m, w, dtype=f32, device=device)
+        self.p_gu = torch.empty(max(t.gateup.splits for t in every), m, 2 * self.mlp_dim, dtype=f32, device=device)
         self.hid = torch.empty(m, self.mlp_dim, dtype=bf16, device=device)
-        self.p_down = torch.empty(t["down"].splits, m, w, dtype=f32, device=device)
+        self.p_down = torch.empty(max(t.down.splits for t in every), m, w, dtype=f32, device=device)
 
     # ── launches ─────────────────────────────────────────────────────
-    def _gemm(self, x, w, p, name: str, dual: bool = False, out=None) -> None:
-        tiles = self.tiles[name]
+    def _gemm(self, x, w, p, tiles: GemmTiles, block_m: int, dual: bool = False, out=None) -> None:
         m, k = x.shape
         n = w.shape[0] // (2 if dual else 1)
         gelu_out = out is not None
         if gelu_out and (not dual or tiles.splits != 1):
             raise ValueError("The GELU epilogue needs the dual gate/up GEMM with one split.")
-        block_m = _block_m(m)
         grid = (triton.cdiv(n, tiles.block_n), tiles.splits, triton.cdiv(m, block_m))
         _skinny_gemm_kernel[grid](
             x,
@@ -624,19 +658,22 @@ class FastDenoiser:
         if cos.dtype != torch.bfloat16:
             cos, sin = cos.to(torch.bfloat16), sin.to(torch.bfloat16)
         res, xn, att, hid = self.res[:m], self.xn[:m], self.att[:m], self.hid[:m]
-        p_qkv, p_o, p_gu, p_down = self.p_qkv[:, :m], self.p_o[:, :m], self.p_gu[:, :m], self.p_down[:, :m]
+        p_qkv, p_o, p_gu, p_down = self.p_qkv, self.p_o, self.p_gu, self.p_down
         n_rows = nh * horizon
-        a = self.attn
-        if n_rows < 128:
-            block_r, block_n, kv_splits, attn_warps = a.block_r, a.block_n, a.kv_splits, a.num_warps
-        else:
-            block_r, block_n, kv_splits = a.block_r_large, a.block_n_large, a.kv_splits_large
-            attn_warps = a.num_warps_large
-        keys_per_split = triton.cdiv(triton.cdiv(prefix_len, kv_splits), block_n) * block_n
-        t = self.tiles
+        t = self.tiles if self.tiles is not None else loop_tiles(m)
+        a, block_m = t.attn, t.block_m
+        if (
+            t.qkv.splits > self.p_qkv.shape[0]
+            or t.o.splits > self.p_o.shape[0]
+            or t.gateup.splits > self.p_gu.shape[0]
+            or t.down.splits > self.p_down.shape[0]
+            or batch * a.kv_splits * n_rows > self.part_m.shape[0]
+        ):
+            raise ValueError("These tiles split further than the scratch buffers were sized for.")
+        keys_per_split = triton.cdiv(triton.cdiv(prefix_len, a.kv_splits), a.block_n) * a.block_n
         dt = -1.0 / num_steps
         mods = self.modulations
-        gelu_fused = t["gateup"].splits == 1
+        gelu_fused = t.gateup.splits == 1
 
         for step in range(num_steps):
             mod = mods[step]
@@ -644,8 +681,8 @@ class FastDenoiser:
             for layer in range(self.num_layers):
                 k_l, v_l = key[layer, :, 0], value[layer, :, 0]  # (B, n_keys, hd)
                 mod_in, mod_post = mod[2 * layer], mod[2 * layer + 1]
-                self._gemm(xn, self.w_qkv[layer], p_qkv, "qkv")
-                _attn_kernel[(batch, triton.cdiv(n_rows, block_r), kv_splits)](
+                self._gemm(xn, self.w_qkv[layer], p_qkv, t.qkv, block_m)
+                _attn_kernel[(batch, triton.cdiv(n_rows, a.block_r), a.kv_splits)](
                     p_qkv,
                     cos,
                     sin,
@@ -664,14 +701,14 @@ class FastDenoiser:
                     mask.stride(1),
                     mask.stride(0),
                     self.scale,
-                    SPLITS=t["qkv"].splits,
+                    SPLITS=t.qkv.splits,
                     NUM_HEADS=nh,
                     HEAD_DIM=hd,
-                    BLOCK_R=block_r,
-                    BLOCK_N=block_n,
+                    BLOCK_R=a.block_r,
+                    BLOCK_N=a.block_n,
                     BLOCK_S=max(16, triton.next_power_of_2(horizon)),
-                    KV_SPLITS=kv_splits,
-                    num_warps=attn_warps,
+                    KV_SPLITS=a.kv_splits,
+                    num_warps=a.num_warps,
                     num_stages=a.num_stages,
                 )
                 _attn_combine_kernel[(batch, n_rows)](
@@ -683,21 +720,21 @@ class FastDenoiser:
                     att.stride(0),
                     NUM_HEADS=nh,
                     HEAD_DIM=hd,
-                    KV_SPLITS=kv_splits,
+                    KV_SPLITS=a.kv_splits,
                     num_warps=4,
                 )
-                self._gemm(att, self.w_o[layer], p_o, "o")
+                self._gemm(att, self.w_o[layer], p_o, t.o, block_m)
                 _resid_norm_kernel[(m,)](
-                    p_o, res, mod_in[2 * w :], mod_post, xn, m, self.eps, SPLITS=t["o"].splits, N=w, num_warps=4
+                    p_o, res, mod_in[2 * w :], mod_post, xn, m, self.eps, SPLITS=t.o.splits, N=w, num_warps=4
                 )
                 if gelu_fused:
-                    self._gemm(xn, self.w_gu[layer], p_gu, "gateup", dual=True, out=hid)
+                    self._gemm(xn, self.w_gu[layer], p_gu, t.gateup, block_m, dual=True, out=hid)
                 else:
-                    self._gemm(xn, self.w_gu[layer], p_gu, "gateup", dual=True)
+                    self._gemm(xn, self.w_gu[layer], p_gu, t.gateup, block_m, dual=True)
                     _gelu_mul_kernel[(m, triton.cdiv(self.mlp_dim, 1024))](
-                        p_gu, hid, m, SPLITS=t["gateup"].splits, N=self.mlp_dim, BLOCK=1024, num_warps=4
+                        p_gu, hid, m, SPLITS=t.gateup.splits, N=self.mlp_dim, BLOCK=1024, num_warps=4
                     )
-                self._gemm(hid, self.w_down[layer], p_down, "down")
+                self._gemm(hid, self.w_down[layer], p_down, t.down, block_m)
                 if layer + 1 < self.num_layers:
                     _resid_norm_kernel[(m,)](
                         p_down,
@@ -707,7 +744,7 @@ class FastDenoiser:
                         xn,
                         m,
                         self.eps,
-                        SPLITS=t["down"].splits,
+                        SPLITS=t.down.splits,
                         N=w,
                         num_warps=4,
                     )
@@ -723,7 +760,7 @@ class FastDenoiser:
                         m,
                         self.eps,
                         dt,
-                        SPLITS=t["down"].splits,
+                        SPLITS=t.down.splits,
                         N=w,
                         A=action_dim,
                         num_warps=8,
