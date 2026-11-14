@@ -17,8 +17,9 @@ dtype: bfloat16
 stages:
   - stage_id: 0
     devices: "0"
-    # Raise to form batches: the fast path serves every batch size (graphs are captured for 1, the powers of
-    # two below this value, and this value). Batching buys little throughput; see the README's batch table.
+    # Keep at 1 for serving: the engine forms batches only for pipelines that declare request batching, which
+    # Pi05Pipeline does not yet do (startup rejects a larger value). The model itself runs formed batches on
+    # the fast path at every size, see the batch table in the README.
     max_num_seqs: 1
     enforce_eager: false
     model_class_name: Pi05Pipeline
